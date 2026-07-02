@@ -36,6 +36,6 @@ out/
 ### VS Code ###
 .vscode/
 
-/src/main/resources/application-secret.yml
+/src/main/resources/application-secret.yaml
 .env
 valkey.conf
