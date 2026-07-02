@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: shareCart-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+    volumes:
+      - db_data:/var/lib/mysql
+
+  valkey:
+    image: valkey/valkey:8.0
+    container_name: shareCart-valkey
+    ports:
+      - "6379:6379"
+    command: valkey-server /usr/local/etc/valkey/valkey.conf
+    volumes:
+      - valkey_data:/data
+      - ./valkey.conf:/usr/local/etc/valkey/valkey.conf
+
+#  app:
+#    build: .
+#    container_name: shareCart-app
+#    ports:
+#      - "8080:8080"
+#    depends_on:
+#      - mysql
+#      - valkey
+
+volumes:
+  db_data:
+  valkey_data:
