@@ -1,4 +1,4 @@
-package com.shareCart.project.domain.auth.model.vo;
+package com.shareCart.project.domain.user.model.vo;
 
 import lombok.*;
 
@@ -6,6 +6,9 @@ import java.time.LocalDateTime;
 
 @Getter
 @Setter
+@AllArgsConstructor
+@NoArgsConstructor
+@Builder
 public class UserVO {
     private Long id;
     private Long townId;
@@ -13,6 +16,7 @@ public class UserVO {
     private String name;
     private String password;
     private String role;
+    private String phone;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

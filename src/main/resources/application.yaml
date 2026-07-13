@@ -13,3 +13,8 @@ mybatis:
   type-aliases-package: com.shareCart.project.domain.*.model..*
   configuration:
     map-underscore-to-camel-case: true
+
+# 로깅
+#logging:
+#  level:
+#    org.springframework.security: DEBUG
