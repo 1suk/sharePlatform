@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.shareCart.project.domain.town.model.mapper.TownMapper">
+    <select id="findTownByRegionId"
+            parameterType="String"
+            resultType="com.shareCart.project.domain.town.model.vo.TownVO">
+    SELECT
+        id,
+        region_id,
+        town_name,
+        sido,
+        sigungu,
+        emd,
+        latitude,
+        longitude
+        FROM `towns`
+        WHERE region_id = #{regionId}
+    </select>
+
+    <insert id="insertTown"
+            parameterType="com.shareCart.project.domain.town.model.vo.TownVO"
+            useGeneratedKeys="true"
+            keyProperty="id">
+    INSERT INTO `towns` (
+        region_id,
+        town_name,
+        sido,
+        sigungu,
+        emd,
+        latitude,
+        longitude
+    )VALUES (
+        #{regionId},
+        #{townName},
+        #{sido},
+        #{sigungu},
+        #{emd},
+        #{latitude},
+        #{longitude}
+    )
+    </insert>
+</mapper>
