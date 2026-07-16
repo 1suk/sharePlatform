@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.Optional;
 
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -24,6 +25,7 @@ import lombok.RequiredArgsConstructor;
 public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     private final JwtTokenProvider jwtTokenProvider;
+    private final StringRedisTemplate redisTemplate;
 
     @Override
     protected void doFilterInternal(
@@ -50,6 +52,12 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 Claims claims = claimsOpt.get();
                 String email = claims.getSubject();
                 String role = claims.get("role", String.class);
+                long tokenVersion = ((Number) claims.get("tokenVersion")).longValue();
+
+                if (!isTokenVersionValid(email, tokenVersion)) {
+                    handleException(response, "TOKEN_INVALIDATED", "만료되었거나 로그아웃 처리된 토큰입니다.");
+                    return;
+                }
 
                 SimpleGrantedAuthority authority = new SimpleGrantedAuthority("ROLE_" + role);
 
@@ -73,6 +81,13 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    private boolean isTokenVersionValid(String email, long tokenVersion){
+        String currentVersion = redisTemplate.opsForValue().get(TokenVersionKeys.key(email));
+        long current = currentVersion == null ? 0L : Long.parseLong(currentVersion);
+
+        return tokenVersion == current;
     }
 
     private String getJwtFromRequest(HttpServletRequest request) {

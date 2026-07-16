@@ -19,20 +19,21 @@ public class JwtTokenProvider {
 
     public JwtTokenProvider(
             @Value("${jwt.secret}") String secret,
-            @Value("${jwt.expiration}") long accessTokenExpiration,
+            @Value("${jwt.access-expiration}") long accessTokenExpiration,
             @Value("${jwt.refresh-expiration}") long refreshTokenExpiration) {
         this.secretKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
         this.accessTokenExpiration = accessTokenExpiration;
         this.refreshTokenExpiration = refreshTokenExpiration;
     }
 
-    public String generateAccessToken(String email, String role) {
+    public String generateAccessToken(String email, String role, long tokenVersion) {
         Date now = new Date();
         Date expiryDate = new Date(now.getTime() + accessTokenExpiration);
 
         return Jwts.builder()
                 .subject(email)
                 .claim("role", role)
+                .claim("tokenVersion", tokenVersion)
                 .issuedAt(now)
                 .expiration(expiryDate)
                 .signWith(secretKey)
@@ -62,11 +63,5 @@ public class JwtTokenProvider {
         } catch (JwtException | IllegalArgumentException e) {
             return Optional.empty();
         }
-    }
-
-    public boolean isTokenExpired(String token) {
-        return validateToken(token)
-                .map(claims -> claims.getExpiration().before(new Date()))
-                .orElse(true);
     }
 }
