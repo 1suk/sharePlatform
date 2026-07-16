@@ -34,7 +34,9 @@
         town_id,
         email,
         name,
-        phone
+        phone,
+        role,
+        password
     FROM `users`
     WHERE email = #{email}
     </select>
