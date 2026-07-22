@@ -35,6 +35,7 @@ public class SecurityConfig {
                         .requestMatchers("/api/auth/reissue").permitAll()
                         .requestMatchers("/api/auth/logout").permitAll()
                         .requestMatchers("/api/users/signup").permitAll()
+                        .requestMatchers("/api/rooms/create").authenticated()
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
