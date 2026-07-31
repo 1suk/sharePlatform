@@ -10,5 +10,6 @@ import java.util.List;
 @Mapper
 public interface RoomMapper {
     void insertRoom(RoomVO roomVO);
-    void insertRoomItems(@Param("roomId") Long RoomId, @Param("items") List<RoomDto.Item> items);
+    void insertRoomItems(@Param("roomId") Long roomId, @Param("items") List<RoomDto.Item> items);
+    RoomVO findRoomById(Long roomId);
 }

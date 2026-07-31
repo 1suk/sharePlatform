@@ -27,4 +27,12 @@ public class RoomDto {
     public static class Item{
         private String itemName;
     }
+
+    @Getter
+    @NoArgsConstructor(access = AccessLevel.PROTECTED)
+    @AllArgsConstructor
+    public static class UpdateItemDetailsRequest {
+        private String unit;
+        private Integer totalQty;
+    }
 }

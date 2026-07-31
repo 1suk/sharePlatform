@@ -2,6 +2,8 @@ package com.shareCart.project.domain.room.service;
 
 import com.shareCart.project.domain.room.model.dto.RoomDto;
 import com.shareCart.project.domain.room.model.mapper.RoomMapper;
+import com.shareCart.project.domain.room.model.mapper.RoomParticipantMapper;
+import com.shareCart.project.domain.room.model.vo.RoomParticipantVO;
 import com.shareCart.project.domain.room.model.vo.RoomVO;
 import com.shareCart.project.domain.user.model.mapper.UserMapper;
 import com.shareCart.project.domain.user.model.vo.UserVO;
@@ -13,6 +15,7 @@ import org.springframework.stereotype.Service;
 public class RoomServiceImpl implements RoomService {
     private final RoomMapper roomMapper;
     private final UserMapper userMapper;
+    private final RoomParticipantMapper roomParticipantMapper;
 
     public void createRoom(String email, RoomDto.Create createDto) {
         UserVO user = userMapper.findByEmail(email);
@@ -36,5 +39,14 @@ public class RoomServiceImpl implements RoomService {
         if(createDto.getItems() != null && !createDto.getItems().isEmpty()) {
             roomMapper.insertRoomItems(roomInfo.getId(), createDto.getItems());
         }
+
+//        roomParticipantMapper.insertParticipant(roomInfo.getId(),hostId,"HOST");
+        RoomParticipantVO participant = RoomParticipantVO.builder()
+                .roomId(roomInfo.getId())
+                .userId(hostId)
+                .role("HOST")
+                .build();
+
+        roomParticipantMapper.insertParticipant(participant);
     }
 }

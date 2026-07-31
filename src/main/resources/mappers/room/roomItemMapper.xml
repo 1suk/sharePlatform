@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.shareCart.project.domain.room.model.mapper.RoomItemMapper">
+    <select id="findRoomItemById"
+            resultType="com.shareCart.project.domain.room.model.vo.RoomItemVO">
+    SELECT
+        id,
+        room_id,
+        item_name,
+        ocr_price,
+        actual_price,
+        total_qty,
+        unit
+    FROM `room_items`
+    WHERE id = #{itemId}
+    </select>
+    
+    <update id="updateItemDetails">
+        UPDATE `room_items`
+        SET
+            unit = #{unit},
+            total_qty = #{totalQty}
+        WHERE id = #{roomItemId}
+    </update>
+
+<!--    <select id="findItemByRoomId" resultType="com.shareCart.project.domain.room.model.vo.RoomItemVO">-->
+<!--        SELECT-->
+<!--            id,-->
+<!--            room_id AS roomId,-->
+<!--            item_name AS itemName,-->
+<!--            ocr_price AS ocrPrice,-->
+<!--            actual_price AS actualPrice,-->
+<!--            total_qty AS totalQty,-->
+<!--            unit-->
+<!--        FROM `room_items`-->
+<!--        WHERE room_id = #{roomId}-->
+<!--    </select>-->
+</mapper>

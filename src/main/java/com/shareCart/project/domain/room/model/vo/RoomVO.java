@@ -16,4 +16,5 @@ public class RoomVO {
     private String marketName;
     private String meetPlace;
     private LocalDateTime meetAt;
+    private Integer maxParticipants;
 }
