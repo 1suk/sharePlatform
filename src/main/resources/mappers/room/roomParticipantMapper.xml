@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.shareCart.project.domain.room.model.mapper.RoomParticipantMapper">
+    <insert id="insertParticipant"
+            parameterType="com.shareCart.project.domain.room.model.vo.RoomParticipantVO"
+            useGeneratedKeys="true"
+            keyProperty="id">
+        INSERT INTO `room_participants` (
+            room_id,
+            user_id,
+            role
+        )VALUES(
+            #{roomId},
+            #{userId},
+            #{role}
+        )
+    </insert>
+
+    <select id="countByRoomId" resultType="int">
+        SELECT COUNT(*)
+        FROM `room_participants`
+        WHERE room_id = #{roomId}
+    </select>
+
+    <select id="findByRoomIdAndUserId" resultType="com.shareCart.project.domain.room.model.vo.RoomParticipantVO">
+        SELECT
+            id,
+            room_id,
+            user_id,
+            role,
+            settlement_status,
+            joined_at
+        FROM `room_participants`
+        WHERE room_id = #{roomId}
+          AND user_id = #{userId}
+    </select>
+</mapper>

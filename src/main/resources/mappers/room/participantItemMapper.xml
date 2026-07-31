@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.shareCart.project.domain.room.model.mapper.ParticipantItemMapper">
+    <insert id="upsertAllocation">
+        INSERT INTO `participant_items`(participant_id,
+                                        item_id,
+                                        alloc_quantity)
+        VALUES (#{participantId},
+                #{itemId},
+                #{quantity}) ON DUPLICATE KEY
+        UPDATE
+            alloc_quantity = #{quantity}
+    </insert>
+
+    <select id="sumAllocatedByItemExcludingParticipant" resultType="java.lang.Integer">
+        SELECT COALESCE(SUM(alloc_quantity), 0)
+        FROM `participant_items`
+        WHERE item_id = #{itemId}
+          AND participant_id != #{participantId}
+    </select>
+</mapper>
