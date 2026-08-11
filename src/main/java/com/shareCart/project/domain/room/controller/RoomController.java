@@ -11,6 +11,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
+
 @RestController
 @RequestMapping("/api/rooms")
 @RequiredArgsConstructor
@@ -53,5 +55,12 @@ public class RoomController {
             @RequestBody RoomDto.UpdateItemDetailsRequest request) {
         roomItemService.updateItemDetails(roomId, roomItemId, email, request.getUnit(), request.getTotalQty());
         return ResponseEntity.ok().build();
+    }
+
+    @GetMapping("/list")
+    public ResponseEntity<List<RoomDto.Summary>> getRoomList(
+            @AuthenticationPrincipal String email){
+        List<RoomDto.Summary> response = roomService.getRoomList(email);
+        return ResponseEntity.ok(response);
     }
 }

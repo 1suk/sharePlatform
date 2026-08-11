@@ -25,6 +25,13 @@
         WHERE id = #{roomItemId}
     </update>
 
+    <select id="findItemNamesByRoomId" resultType="java.lang.String">
+        SELECT item_name
+        FROM room_items
+        WHERE room_id = #{roomId}
+        LIMIT 3
+    </select>
+
 <!--    <select id="findItemByRoomId" resultType="com.shareCart.project.domain.room.model.vo.RoomItemVO">-->
 <!--        SELECT-->
 <!--            id,-->

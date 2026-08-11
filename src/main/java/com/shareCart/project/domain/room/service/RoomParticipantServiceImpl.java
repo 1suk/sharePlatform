@@ -10,9 +10,11 @@ import com.shareCart.project.domain.user.model.mapper.UserMapper;
 import com.shareCart.project.domain.user.model.vo.UserVO;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 @RequiredArgsConstructor
+@Transactional(readOnly = true)
 public class RoomParticipantServiceImpl implements RoomParticipantService {
     private final UserMapper userMapper;
     private final RoomParticipantMapper roomParticipantMapper;
@@ -20,7 +22,14 @@ public class RoomParticipantServiceImpl implements RoomParticipantService {
     private final ParticipantItemMapper participantItemMapper;
     private final RoomItemMapper roomItemMapper;
 
+    @Transactional
     public void joinRoom(Long roomId, String email) {
+//        RoomVO room = roomMapper.findRoomByIdForUpdate(roomId);
+//
+//        if(room == null){
+//            throw new IllegalArgumentException("존재하지 않는 방입니다.");
+//        }
+
         UserVO user = userMapper.findByEmail(email);
         if(user == null){
             throw new IllegalArgumentException("존재하지 않는 사용자입니다.");
@@ -36,9 +45,25 @@ public class RoomParticipantServiceImpl implements RoomParticipantService {
             throw new IllegalArgumentException("존재하지 않는 방입니다.");
         }
 
-        int currentCount = roomParticipantMapper.countByRoomId(roomId);
-        if(currentCount >= room.getMaxParticipants()){
-            throw new IllegalStateException("참여 인원인 가득 찼습니다.");
+//        if(room.getCurrentParticipants() >= room.getMaxParticipants()){
+//            throw new IllegalStateException("정원이 가득찬 방입니다");
+//        }
+
+//        try {
+//            Thread.sleep(2000);
+//        } catch (InterruptedException e) {
+//
+//        }
+
+//        int currentCount = roomParticipantMapper.countByRoomId(roomId);
+//        if(currentCount >= room.getMaxParticipants()){
+//            throw new IllegalStateException("참여 인원인 가득 찼습니다.");
+//        }
+
+        int updatedRows = roomMapper.increaseParticipants(roomId);
+
+        if (updatedRows == 0) {
+            throw new IllegalArgumentException("정원이 가득찬 방입니다");
         }
 
         RoomParticipantVO participant = RoomParticipantVO.builder()

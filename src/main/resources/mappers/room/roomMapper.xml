@@ -49,4 +49,36 @@
         FROM `rooms`
         WHERE id = #{roomId}
     </select>
+
+    <select id="findRoomsByTownId" resultType="com.shareCart.project.domain.room.model.vo.RoomList">
+        SELECT
+            r.id,
+            r.market_name,
+            r.meet_place,
+            r.meet_at,
+            r.max_participants,
+            COUNT(rp.id) AS currentParticipants
+        FROM rooms r
+        LEFT JOIN room_participants rp ON r.id = rp.room_id
+        WHERE r.town_id = #{townId}
+        GROUP BY r.id
+    </select>
+
+    <update id="increaseParticipants">
+        UPDATE `rooms`
+        SET current_participants = current_participants + 1,
+            updated_at = NOW()
+        WHERE id = #{room_id}
+        AND current_participants &lt; max_participants
+    </update>
+
+    <select id="findRoomByIdForUpdate"
+            resultType="com.shareCart.project.domain.room.model.vo.RoomVO">
+        SELECT
+            id,
+            max_participants
+        FROM `rooms`
+        WHERE id = #{roomId}
+            FOR UPDATE
+    </select>
 </mapper>

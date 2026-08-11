@@ -15,6 +15,6 @@ mybatis:
     map-underscore-to-camel-case: true
 
 # 로깅
-#logging:
-#  level:
-#    org.springframework.security: DEBUG
+logging:
+  level:
+    org.springframework.security: DEBUG
