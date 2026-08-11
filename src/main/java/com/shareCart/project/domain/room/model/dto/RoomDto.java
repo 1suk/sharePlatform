@@ -35,4 +35,20 @@ public class RoomDto {
         private String unit;
         private Integer totalQty;
     }
+
+
+    @Getter
+    @NoArgsConstructor(access = AccessLevel.PROTECTED)
+    @AllArgsConstructor
+    @Builder
+    public static class Summary{
+        private Long roomId;
+        private String marketName;
+        private String meetPlace;
+        private LocalDateTime meetAt;
+        private Integer currentParticipants;
+        private Integer maxParticipants;
+        private List<String> itemNames;
+        private String status;
+    }
 }

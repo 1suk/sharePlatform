@@ -4,6 +4,8 @@ import com.shareCart.project.domain.room.model.vo.RoomItemVO;
 import org.apache.ibatis.annotations.Mapper;
 import org.springframework.data.repository.query.Param;
 
+import java.util.List;
+
 @Mapper
 public interface RoomItemMapper {
     RoomItemVO findRoomItemById(Long id);
@@ -12,4 +14,6 @@ public interface RoomItemMapper {
             @Param("unit") String unit,
             @Param("totalQty") Integer totalQty
     );
+
+    List<String> findItemNamesByRoomId(Long roomId);
 }
