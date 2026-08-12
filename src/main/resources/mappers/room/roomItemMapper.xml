@@ -21,6 +21,7 @@
         UPDATE `room_items`
         SET
             unit = #{unit},
+            step_qty = #{stepQty},
             total_qty = #{totalQty}
         WHERE id = #{roomItemId}
     </update>

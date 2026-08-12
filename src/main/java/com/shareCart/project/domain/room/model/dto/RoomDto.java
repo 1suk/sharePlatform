@@ -33,6 +33,7 @@ public class RoomDto {
     @AllArgsConstructor
     public static class UpdateItemDetailsRequest {
         private String unit;
+        private Integer stepQty;
         private Integer totalQty;
     }
 

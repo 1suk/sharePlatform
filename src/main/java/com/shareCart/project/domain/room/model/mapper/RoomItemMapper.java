@@ -12,6 +12,7 @@ public interface RoomItemMapper {
     int updateItemDetails(
             @Param("roomItemId") Long roomItemId,
             @Param("unit") String unit,
+            @Param("stepQty") Integer stepQty,
             @Param("totalQty") Integer totalQty
     );
 

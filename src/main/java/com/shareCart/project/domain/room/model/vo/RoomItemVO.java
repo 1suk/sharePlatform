@@ -14,5 +14,6 @@ public class RoomItemVO {
     private Integer ocrPrice;
     private Integer actualPrice;
     private Integer totalQty;
+    private Integer stepQty;
     private String unit;
 }
