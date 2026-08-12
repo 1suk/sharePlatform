@@ -16,7 +16,7 @@ public class RoomItemServiceImpl implements RoomItemService {
     private final UserMapper userMapper;
     private final RoomMapper roomMapper;
 
-    public void updateItemDetails(Long roomId, Long roomItemId, String email, String unit, Integer totalQty){
+    public void updateItemDetails(Long roomId, Long roomItemId, String email, String unit, Integer stepQty,Integer totalQty){
         UserVO user = userMapper.findByEmail(email);
         if (user == null) {
             throw new IllegalArgumentException("존재하지 않는 사용자입니다.");
@@ -36,6 +36,6 @@ public class RoomItemServiceImpl implements RoomItemService {
             throw new IllegalArgumentException("존재하지 않는 품목입니다.");
         }
 
-        roomItemMapper.updateItemDetails(roomItemId, unit, totalQty);
+        roomItemMapper.updateItemDetails(roomItemId, unit, stepQty ,totalQty);
     }
 }

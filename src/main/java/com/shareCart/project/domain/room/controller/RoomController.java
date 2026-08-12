@@ -53,7 +53,7 @@ public class RoomController {
             @PathVariable Long roomItemId,
             @AuthenticationPrincipal String email,
             @RequestBody RoomDto.UpdateItemDetailsRequest request) {
-        roomItemService.updateItemDetails(roomId, roomItemId, email, request.getUnit(), request.getTotalQty());
+        roomItemService.updateItemDetails(roomId, roomItemId, email, request.getUnit(),request.getStepQty(),request.getTotalQty());
         return ResponseEntity.ok().build();
     }
 
