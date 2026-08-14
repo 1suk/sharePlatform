@@ -11,6 +11,7 @@
         item_name,
         ocr_price,
         actual_price,
+        step_qty,
         total_qty,
         unit
     FROM `room_items`

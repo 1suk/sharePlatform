@@ -8,7 +8,9 @@ public class ParticipantItemDto {
     @NoArgsConstructor(access = AccessLevel.PROTECTED)
     public static class AllocateRequest{
         private Long itemId;
-        private Integer quantity;
-        //        private Long participantId;
+        private String requestId;
+        private Integer step;
+//        private Integer quantity;
+//        private Long participantId;
     }
 }

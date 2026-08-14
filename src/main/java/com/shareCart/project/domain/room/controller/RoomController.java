@@ -43,7 +43,7 @@ public class RoomController {
             @AuthenticationPrincipal String email,
             @RequestBody ParticipantItemDto.AllocateRequest request){
 
-        roomParticipantService.allocateItem(roomId, email, request.getItemId(), request.getQuantity());
+        roomParticipantService.allocateItem(roomId, email, request.getItemId(),request.getRequestId() ,request.getStep());
         return ResponseEntity.ok().build();
     }
 
