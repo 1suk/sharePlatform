@@ -20,4 +20,10 @@
         WHERE item_id = #{itemId}
           AND participant_id != #{participantId}
     </select>
+
+    <select id="findByItemId" resultType="com.shareCart.project.domain.room.model.vo.ParticipantItemVO">
+        SELECT id, participant_id, item_id, alloc_quantity
+        FROM participant_items
+        WHERE item_id = #{itemId}
+    </select>
 </mapper>
