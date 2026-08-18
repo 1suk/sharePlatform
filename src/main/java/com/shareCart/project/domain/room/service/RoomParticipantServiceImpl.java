@@ -11,13 +11,22 @@ import com.shareCart.project.domain.room.model.vo.RoomVO;
 import com.shareCart.project.domain.user.model.mapper.UserMapper;
 import com.shareCart.project.domain.user.model.vo.UserVO;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.QueryTimeoutException;
+import org.springframework.data.redis.RedisConnectionFailureException;
+import org.springframework.data.redis.RedisSystemException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 @Transactional(readOnly = true)
@@ -28,11 +37,16 @@ public class RoomParticipantServiceImpl implements RoomParticipantService {
     private final ParticipantItemMapper participantItemMapper;
     private final RoomItemMapper roomItemMapper;
     private final DefaultRedisScript<Long> allocScript;
+    private final DefaultRedisScript<Long> restoreAllocScript;
     private final StringRedisTemplate redisTemplate;
 
     private static final long DUPLICATE_REQUEST = -1L;
     private static final long NOT_ENOUGH_QTY = -2L;
     private static final long OVER_CAP = -3L;
+
+    private static final String DIRTY_SET_KEY = "dirty:items";
+
+    private final ConcurrentHashMap<Long, Object> restoreLocks = new ConcurrentHashMap<>();
 
     @Transactional
     public void joinRoom(Long roomId, String email) {
@@ -84,7 +98,11 @@ public class RoomParticipantServiceImpl implements RoomParticipantService {
                 .role("MEMBER")
                 .build();
 
-        roomParticipantMapper.insertParticipant(participant);
+        try {
+            roomParticipantMapper.insertParticipant(participant);
+        } catch (DataIntegrityViolationException e) {
+            throw new IllegalStateException("이미 참여한 방입니다.");
+        }
     }
 
     public void allocateItem(Long roomId, String email, Long itemId, String requestId,Integer step) {
@@ -112,49 +130,86 @@ public class RoomParticipantServiceImpl implements RoomParticipantService {
 
         int delta = step * item.getStepQty();
 
-        String dedupKey = "dedup:" + requestId;
+//        String dedupKey = "dedup:" + requestId;
+        String dedupKey = "dedup:" + itemId + ":" + participant.getId() + ":" + requestId;
         String zsetKey = "zset:" + itemId;
         String totalKey = "total:" + itemId;
 
-        Long result = redisTemplate.execute(
-                allocScript,
-                List.of(dedupKey, zsetKey, totalKey),
-                requestId,
-                String.valueOf(participant.getId()),
-                String.valueOf(delta),
-                String.valueOf(item.getTotalQty())
-        );
+        restoreIfMissing(itemId, zsetKey, totalKey);
 
-        if (result == null) {
-            throw new IllegalStateException("할당 처리 중 오류가 발생했습니다.");
-        }
-        if (result == DUPLICATE_REQUEST) {
-            return;
-        }
-        if (result == NOT_ENOUGH_QTY) {
-            throw new IllegalStateException("본인 할당 수량이 부족합니다.");
-        }
-        if (result == OVER_CAP) {
-            throw new IllegalStateException("남은 수량을 초과했습니다.");
+
+        try {
+            Long result = redisTemplate.execute(
+                    allocScript,
+                    List.of(dedupKey, zsetKey, totalKey, DIRTY_SET_KEY),
+                    requestId,
+                    String.valueOf(participant.getId()),
+                    String.valueOf(delta),
+                    String.valueOf(item.getTotalQty()),
+                    String.valueOf(itemId)
+            );
+
+            if (result == null) {
+                throw new IllegalStateException("할당 처리 중 오류가 발생했습니다.");
+            }
+            if (result == DUPLICATE_REQUEST) {
+                return;
+            }
+            if (result == NOT_ENOUGH_QTY) {
+                throw new IllegalStateException("본인 할당 수량이 부족합니다.");
+            }
+            if (result == OVER_CAP) {
+                throw new IllegalStateException("남은 수량을 초과했습니다.");
+            }
+        } catch (RedisConnectionFailureException | QueryTimeoutException e) {
+            log.error("Redis 연결 실패: itemId={}, requestId={}", itemId, requestId, e);
+            throw new IllegalStateException("일시적으로 서비스를 이용할 수 없습니다. 잠시 후 다시 시도해주세요.");
+        } catch (RedisSystemException e) {
+            if (e.getMessage() != null && e.getMessage().contains("OOM")) {
+                throw new IllegalStateException("일시적으로 요청이 많아 처리할 수 없습니다. 잠시 후 다시 시도해주세요.");
+            }
+            throw e;
         }
 
 //        participantItemMapper.upsertAllocation(participant.getId(), itemId, quantity);
     }
 
-//    private void restoreIfMissing(Long itemId, String zsetKey, String totalKey) {
-//        if (Boolean.TRUE.equals(redisTemplate.hasKey(zsetKey))) {
-//            return; // 이미 있으면 복원 필요 없음
-//        }
-//
-//        List<ParticipantItemVO> allocations = participantItemMapper.findByItemId(itemId);
-//        if (allocations.isEmpty()) return;
-//
-//        long total = 0;
-//        for (ParticipantItemVO alloc : allocations) {
-//            redisTemplate.opsForZSet().add(zsetKey, String.valueOf(alloc.getParticipantId()), alloc.getAllocQuantity());
-//            total += alloc.getAllocQuantity();
-//        }
-//        redisTemplate.opsForValue().set(totalKey, String.valueOf(total));
-//    }
+    private void restoreIfMissing(Long itemId, String zsetKey, String totalKey) {
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(zsetKey))) {
+            return;
+        }
+
+        Object lock = restoreLocks.computeIfAbsent(itemId, id -> new Object());
+            synchronized (lock) {
+                if (Boolean.TRUE.equals(redisTemplate.hasKey(zsetKey))) {
+                    return;
+                }
+
+                List<ParticipantItemVO> allocations = participantItemMapper.findByItemId(itemId);
+                if (allocations.isEmpty()) {
+                    return;
+                }
+
+                String tempZsetKey = zsetKey + ":restoring:" + UUID.randomUUID();
+
+                long total = 0;
+                for (ParticipantItemVO alloc : allocations) {
+                    redisTemplate.opsForZSet().add(
+                            tempZsetKey,
+                            String.valueOf(alloc.getParticipantId()),
+                            alloc.getAllocQuantity()
+                    );
+                    total += alloc.getAllocQuantity();
+                }
+
+                redisTemplate.expire(tempZsetKey, Duration.ofMinutes(5));
+
+                redisTemplate.execute(
+                        restoreAllocScript,
+                        List.of(tempZsetKey, zsetKey, totalKey),
+                        String.valueOf(total)
+                );
+        }
+    }
 }
 
