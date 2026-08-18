@@ -26,4 +26,13 @@
         FROM participant_items
         WHERE item_id = #{itemId}
     </select>
+
+    <insert id="upsertAllocationBatch">
+        INSERT INTO `participant_items` (participant_id, item_id, alloc_quantity)
+        VALUES
+        <foreach collection="list" item="alloc" separator=",">
+            (#{alloc.participantId}, #{alloc.itemId}, #{alloc.allocQuantity})
+        </foreach>
+        ON DUPLICATE KEY UPDATE alloc_quantity = VALUES(alloc_quantity)
+    </insert>
 </mapper>

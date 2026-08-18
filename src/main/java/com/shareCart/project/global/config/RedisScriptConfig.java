@@ -15,4 +15,12 @@ public class RedisScriptConfig {
         script.setResultType(Long.class);
         return script;
     }
+
+    @Bean
+    public DefaultRedisScript<Long> restoreAllocScript() {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setLocation(new ClassPathResource("scripts/restoreAlloc.lua"));
+        script.setResultType(Long.class);
+        return script;
+    }
 }

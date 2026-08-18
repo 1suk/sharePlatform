@@ -24,5 +24,8 @@ end
 
 redis.call('ZINCRBY', zsetKey, delta, participantId)
 redis.call('INCRBY', totalKey, delta)
+redis.call('EXPIRE', zsetKey, 604800)
+redis.call('EXPIRE', totalKey, 604800)
 redis.call('SET', dedupKey, 1, 'EX', 86400)
+redis.call('SADD', dirtySetKey, itemId)
 return 1
