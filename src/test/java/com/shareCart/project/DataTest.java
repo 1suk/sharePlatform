@@ -1,46 +1,21 @@
 package com.shareCart.project;
 
+import lombok.*;
+
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.Map;
+import java.util.Comparator;
+
 
 public class DataTest {
 
-    public static void main(String[] args) throws InterruptedException {
-        List<Integer> unsafeList = new ArrayList<>();
-        List<Integer> safeList = new CopyOnWriteArrayList<>();
+    public static void main(String[] args) {
+        List<String> words = new ArrayList<>(List.of("Cat", "Elephant", "Dog", "Giraffe", "Ant"));
 
-        int threadCount = 10;
-        int countPerThread = 1000;
+        words.sort((a,b) -> Integer.compare(b.length(), a.length()));
 
-        Runnable addUnsafe = () -> {
-            for (int i = 0; i < countPerThread; i++) {
-                unsafeList.add(i);
-            }
-        };
-
-        Runnable addSafe = () -> {
-            for (int i = 0; i < countPerThread; i++) {
-                safeList.add(i);
-            }
-        };
-
-        Thread[] unsafeThreads = new Thread[threadCount];
-        for (int i = 0; i < threadCount; i++) {
-            unsafeThreads[i] = new Thread(addUnsafe);
-            unsafeThreads[i].start();
-        }
-        for (Thread t : unsafeThreads) t.join();
-
-        Thread[] safeThreads = new Thread[threadCount];
-        for (int i = 0; i < threadCount; i++) {
-            safeThreads[i] = new Thread(addSafe);
-            safeThreads[i].start();
-        }
-        for (Thread t : safeThreads) t.join();
-
-        System.out.println("기대하는 데이터 개수: " + (threadCount * countPerThread));
-        System.out.println("ArrayList 결과: " + unsafeList.size());
-        System.out.println("CopyOnWriteArrayList 결과: " + safeList.size());
+        words.forEach(System.out::println);
     }
 }

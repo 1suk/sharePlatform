@@ -52,4 +52,12 @@ public class RoomDto {
         private List<String> itemNames;
         private String status;
     }
+
+    @Getter
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class ItemSummary{
+        private Long roomId;
+        private String itemName;
+    }
 }

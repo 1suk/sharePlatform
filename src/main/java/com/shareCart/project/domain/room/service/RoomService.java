@@ -1,8 +1,6 @@
 package com.shareCart.project.domain.room.service;
 
 import com.shareCart.project.domain.room.model.dto.RoomDto;
-import com.shareCart.project.domain.room.model.vo.RoomVO;
-import org.springframework.stereotype.Service;
 
 import java.util.List;
 

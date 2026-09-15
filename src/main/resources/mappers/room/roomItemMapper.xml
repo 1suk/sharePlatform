@@ -34,6 +34,17 @@
         LIMIT 3
     </select>
 
+    <select id="findItemNamesByRoomIds"
+            resultType="com.shareCart.project.domain.room.model.dto.RoomDto$ItemSummary">
+        SELECT room_id, item_name
+        FROM room_items
+        WHERE room_id IN
+        <foreach item="id" collection="roomIds" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+        ORDER BY id ASC
+    </select>
+
 <!--    <select id="findItemByRoomId" resultType="com.shareCart.project.domain.room.model.vo.RoomItemVO">-->
 <!--        SELECT-->
 <!--            id,-->

@@ -9,13 +9,17 @@ import com.shareCart.project.domain.room.model.vo.RoomParticipantVO;
 import com.shareCart.project.domain.room.model.vo.RoomVO;
 import com.shareCart.project.domain.user.model.mapper.UserMapper;
 import com.shareCart.project.domain.user.model.vo.UserVO;
+import jdk.jfr.Category;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.sql.Array;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
+import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class RoomServiceImpl implements RoomService {
@@ -64,21 +68,55 @@ public class RoomServiceImpl implements RoomService {
         }
 
         List<RoomList> rooms = roomMapper.findRoomsByTownId(user.getTownId());
+        if(rooms.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<Long> roomIds = new ArrayList<>();
+
+        for(RoomList rooom : rooms){
+            roomIds.add(rooom.getId());
+        }
+
+
+        List<RoomDto.ItemSummary> items = roomItemMapper.findItemNamesByRoomIds(roomIds);
+        log.debug(items.toString());
+
+        Map<Long, List<String>> roomWithItems = new HashMap<>();
+        for (RoomDto.ItemSummary item : items) {
+            Long roomId = item.getRoomId();
+            String itemName = item.getItemName();
+
+            if(!roomWithItems.containsKey(roomId)){
+                roomWithItems.put(roomId, new ArrayList<>());
+            }
+
+            roomWithItems.get(roomId).add(itemName);
+        }
+        log.debug(roomWithItems.toString());
 
         List<RoomDto.Summary> summaries = new ArrayList<>();
 
-        for(RoomList room : rooms){
-            List<String> itemNames = roomItemMapper.findItemNamesByRoomId(room.getId());
-            String status = calculateStatus(room.getMeetAt(), room.getCurrentParticipants(),room.getMaxParticipants());
+        for (RoomList room : rooms){
+            List<String> roomItems = roomWithItems.getOrDefault(room.getId(), new ArrayList<>());
+
+            List<String> limitedItems;
+            if(roomItems.size() > 3){
+                limitedItems = roomItems.subList(0,3);
+            }else{
+                limitedItems = roomItems;
+            }
+
+            String status = calculateStatus(room.getMeetAt(), room.getCurrentParticipants(), room.getMaxParticipants());
 
             summaries.add(RoomDto.Summary.builder()
                     .roomId(room.getId())
                     .marketName(room.getMarketName())
                     .meetPlace(room.getMeetPlace())
                     .meetAt(room.getMeetAt())
-                    .currentParticipants(room.getCurrentParticipants())
                     .maxParticipants(room.getMaxParticipants())
-                    .itemNames(itemNames)
+                    .currentParticipants(room.getCurrentParticipants())
+                    .itemNames(limitedItems)
                     .status(status)
                     .build());
         }
@@ -93,3 +131,4 @@ public class RoomServiceImpl implements RoomService {
         return "모집중";
     }
 }
+

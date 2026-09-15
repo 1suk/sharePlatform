@@ -137,7 +137,6 @@ public class RoomParticipantServiceImpl implements RoomParticipantService {
 
         restoreIfMissing(itemId, zsetKey, totalKey);
 
-
         try {
             Long result = redisTemplate.execute(
                     allocScript,
