@@ -4,12 +4,12 @@ import com.shareCart.project.domain.room.model.mapper.ParticipantItemMapper;
 import com.shareCart.project.domain.room.model.vo.ParticipantItemVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.*;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -18,104 +18,95 @@ import java.util.Set;
 @Component
 @RequiredArgsConstructor
 public class SyncScheduler {
-
     private static final String DIRTY_SET_KEY = "dirty:items";
-    private static final int POP_BATCH_SIZE = 100;
+    private static final String PROCESSING_ZSET_KEY = "processing:items";
+    private static final int BATCH_SIZE = 100;
+    private static final long PROCESSING_TIMEOUT_MS = 30_000L;
+    private static final DefaultRedisScript<List> CLAIM_SCRIPT = script("scripts/claimDirtyItems.lua", List.class);
+    private static final DefaultRedisScript<Long> RECOVER_SCRIPT = script("scripts/recoverProcessingItems.lua", Long.class);
+    private static final DefaultRedisScript<Long> ACK_SCRIPT = script("scripts/ackProcessingItem.lua", Long.class);
 
     private final StringRedisTemplate redisTemplate;
     private final ParticipantItemMapper participantItemMapper;
 
-    @Scheduled(fixedDelay = 30000)
+    @Scheduled(fixedDelay = 30_000)
     public void syncToDb() {
         try {
-            List<String> batch = redisTemplate.opsForSet().pop(DIRTY_SET_KEY, POP_BATCH_SIZE);
-            if (batch == null || batch.isEmpty()) {
-                return;
-            }
-
-            List<String> failedItemIds = new ArrayList<>();
-            for (String itemId : batch) {
-                if (!syncItem(itemId)) {
-                    failedItemIds.add(itemId);
+            long claimedAt = System.currentTimeMillis();
+            List<?> claimed = redisTemplate.execute(CLAIM_SCRIPT,
+                    List.of(DIRTY_SET_KEY, PROCESSING_ZSET_KEY),
+                    String.valueOf(BATCH_SIZE), String.valueOf(claimedAt));
+            if (claimed == null) return;
+            for (Object member : claimed) {
+                String itemId = String.valueOf(member);
+                try {
+                    if (syncItem(itemId)) {
+                        redisTemplate.execute(ACK_SCRIPT, List.of(PROCESSING_ZSET_KEY),
+                                itemId, String.valueOf(claimedAt));
+                    }
+                } catch (Exception e) {
+                    log.error("Item synchronization failed; retained for recovery: itemId={}", itemId, e);
                 }
             }
-
-            if (!failedItemIds.isEmpty()) {
-                redisTemplate.opsForSet().add(DIRTY_SET_KEY, failedItemIds.toArray(new String[0]));
-            }
         } catch (Exception e) {
-            log.error("Redis-DB 동기화 배치 실행 중 예외 발생", e);
+            log.error("Redis-DB synchronization batch failed", e);
         }
     }
 
-    @Scheduled(fixedDelay = 60 * 60 * 1000) //
-    public void reconcileDirtySet() {
-        int count = 0;
+    @Scheduled(fixedDelay = 10_000)
+    public void recoverTimedOutItems() {
+        long cutoff = System.currentTimeMillis() - PROCESSING_TIMEOUT_MS;
         try {
-            ScanOptions options = ScanOptions.scanOptions().match("zset:*").count(100).build();
-            try (Cursor<byte[]> cursor = redisTemplate.executeWithStickyConnection(
-                    (RedisCallback<Cursor<byte[]>>) (RedisConnection conn) -> conn.scan(options))) {
-                while (cursor.hasNext()) {
-                    String key = new String(cursor.next(), StandardCharsets.UTF_8);
-                    String itemId = key.substring("zset:".length());
-                    try {
-                        Long.parseLong(itemId);
-                        redisTemplate.opsForSet().add(DIRTY_SET_KEY, itemId);
-                        count++;
-                    } catch (NumberFormatException ignored) {
-                    }
-                }
+            Set<String> expired = redisTemplate.opsForZSet()
+                    .rangeByScore(PROCESSING_ZSET_KEY, Double.NEGATIVE_INFINITY, cutoff, 0, BATCH_SIZE);
+            if (expired == null) return;
+            for (String itemId : expired) {
+                redisTemplate.execute(RECOVER_SCRIPT, List.of(PROCESSING_ZSET_KEY, DIRTY_SET_KEY),
+                        itemId, String.valueOf(cutoff));
             }
-            log.info("dirty set 안전망 스캔 완료: {}개 itemId 재마킹", count);
         } catch (Exception e) {
-            log.error("dirty set 안전망 스캔 실패", e);
+            log.error("Processing queue recovery failed", e);
         }
     }
 
     private boolean syncItem(String itemId) {
-        Long parsedItemId;
+        long parsedItemId;
         try {
             parsedItemId = Long.parseLong(itemId);
         } catch (NumberFormatException e) {
-            log.warn("잘못된 dirty set itemId 형식: {}", itemId);
+            log.warn("Skipping invalid dirty set itemId: {}", itemId);
             return true;
         }
-
-        String zsetKey = "zset:" + itemId;
         Set<ZSetOperations.TypedTuple<String>> entries =
-                redisTemplate.opsForZSet().rangeWithScores(zsetKey, 0, -1);
-
-        if (entries == null || entries.isEmpty()) {
-            return true;
-        }
+                redisTemplate.opsForZSet().rangeWithScores("zset:" + itemId, 0, -1);
+        if (entries == null || entries.isEmpty()) return true;
 
         List<ParticipantItemVO> batch = new ArrayList<>(entries.size());
         for (ZSetOperations.TypedTuple<String> entry : entries) {
             try {
                 if (entry.getValue() == null) continue;
-                Long participantId = Long.parseLong(entry.getValue());
+                long participantId = Long.parseLong(entry.getValue());
                 int qty = entry.getScore() == null ? 0 : entry.getScore().intValue();
                 batch.add(ParticipantItemVO.builder()
-                        .participantId(participantId)
-                        .itemId(parsedItemId)
-                        .allocQuantity(qty)
-                        .build());
+                        .participantId(participantId).itemId(parsedItemId).allocQuantity(qty).build());
             } catch (NumberFormatException e) {
-                log.warn("잘못된 zset 엔트리 형식: itemId={}, entry={}", itemId, entry, e);
+                log.warn("Skipping invalid allocation entry: itemId={}, entry={}", itemId, entry, e);
             }
         }
-
-        if (batch.isEmpty()) {
-            return true;
-        }
-
+        if (batch.isEmpty()) return true;
         try {
             participantItemMapper.upsertAllocationBatch(batch);
             return true;
         } catch (Exception e) {
-            log.error("DB Batch Upsert 동기화 실패: itemId={}", itemId, e);
+            log.error("DB batch upsert failed: itemId={}", itemId, e);
             return false;
         }
     }
-}
 
+    private static <T> DefaultRedisScript<T> script(String path, Class<T> resultType) {
+        DefaultRedisScript<T> script = new DefaultRedisScript<>();
+        script.setLocation(new ClassPathResource(path));
+        script.setResultType(resultType);
+        return script;
+    }
+}
