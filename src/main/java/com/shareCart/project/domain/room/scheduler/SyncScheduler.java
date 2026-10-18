@@ -1,16 +1,13 @@
 package com.shareCart.project.domain.room.scheduler;
 
-import com.shareCart.project.domain.room.model.mapper.ParticipantItemMapper;
-import com.shareCart.project.domain.room.model.vo.ParticipantItemVO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.data.redis.core.*;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -27,7 +24,7 @@ public class SyncScheduler {
     private static final DefaultRedisScript<Long> ACK_SCRIPT = script("scripts/ackProcessingItem.lua", Long.class);
 
     private final StringRedisTemplate redisTemplate;
-    private final ParticipantItemMapper participantItemMapper;
+    private final AllocationFlusher allocationFlusher;
 
     @Scheduled(fixedDelay = 30_000)
     public void syncToDb() {
@@ -40,7 +37,7 @@ public class SyncScheduler {
             for (Object member : claimed) {
                 String itemId = String.valueOf(member);
                 try {
-                    if (syncItem(itemId)) {
+                    if (allocationFlusher.flush(itemId)) {
                         redisTemplate.execute(ACK_SCRIPT, List.of(PROCESSING_ZSET_KEY),
                                 itemId, String.valueOf(claimedAt));
                     }
@@ -66,40 +63,6 @@ public class SyncScheduler {
             }
         } catch (Exception e) {
             log.error("Processing queue recovery failed", e);
-        }
-    }
-
-    private boolean syncItem(String itemId) {
-        long parsedItemId;
-        try {
-            parsedItemId = Long.parseLong(itemId);
-        } catch (NumberFormatException e) {
-            log.warn("Skipping invalid dirty set itemId: {}", itemId);
-            return true;
-        }
-        Set<ZSetOperations.TypedTuple<String>> entries =
-                redisTemplate.opsForZSet().rangeWithScores("zset:" + itemId, 0, -1);
-        if (entries == null || entries.isEmpty()) return true;
-
-        List<ParticipantItemVO> batch = new ArrayList<>(entries.size());
-        for (ZSetOperations.TypedTuple<String> entry : entries) {
-            try {
-                if (entry.getValue() == null) continue;
-                long participantId = Long.parseLong(entry.getValue());
-                int qty = entry.getScore() == null ? 0 : entry.getScore().intValue();
-                batch.add(ParticipantItemVO.builder()
-                        .participantId(participantId).itemId(parsedItemId).allocQuantity(qty).build());
-            } catch (NumberFormatException e) {
-                log.warn("Skipping invalid allocation entry: itemId={}, entry={}", itemId, entry, e);
-            }
-        }
-        if (batch.isEmpty()) return true;
-        try {
-            participantItemMapper.upsertAllocationBatch(batch);
-            return true;
-        } catch (Exception e) {
-            log.error("DB batch upsert failed: itemId={}", itemId, e);
-            return false;
         }
     }
 

@@ -1,244 +1,242 @@
-# 결제 기능 구현 계획 (plan.md)
+# 정산(계좌이체) 기능 구현 계획 (plan.md)
 
 > 상태: **검토 대기** (CLAUDE.md 작업 규칙에 따라 구현 전 승인 필요)
-> 작성일: 2026-10-04
-> 범위: 공동 장보기 방(room)의 참여자별 분담금 산정 → PG 결제 → 승인/취소/대사(reconciliation)
+> 작성일: 2026-10-04 / 개정: 2026-10-18 (v7, MVP 범위 확정)
+> 범위: 공동 장보기 방(room)에서 할당 마감 → 방장 장보기 → 실제 금액 입력 → 참여자별 분담금 산정 → 방장 계좌로 송금 → 방장 입금 확인
+
+### 변경 이력
+
+| 버전 | 내용 |
+|---|---|
+| v7 | **MVP만 구현**하고 미룬 기능은 §12 "2차 구현"에 정리(계좌 재입력 API 등). 예외 핸들러는 **정산 컨트롤러 전용**으로 축소해 기존 API는 건드리지 않음. |
+| v6 | 결정 사항 반영. ① **장보는 동안 할당 금지**: `SHOPPING` 상태를 추가하고, 할당 잠금을 "장보기 시작" 시점으로 앞당김. ② 계좌 Redis TTL 7일 확정. ③ 원 단위 나머지는 방장 부담 확정. ④ **할당 0개 MEMBER는 허용하지 않음**: 장보기 시작 시 차단. ⑤ `COMPLETED`는 되돌릴 수 없음 확정. ⑥ 전역 예외 핸들러 추가 확정(기존 API 포함). |
+| v5 | 장을 먼저 보고 실제 금액으로 정산. 정산 취소 추가. 계좌는 Redis에 저장해 DDL 없음. 정산 중 방 나가기 금지. |
+| v4 | 토스(PG)를 제거하고 계좌이체 + 방장 입금 확인 방식으로 바꿈. |
+| v3 | 방장 분담금은 표시만 하고 MEMBER만 낸다. |
+| v2 | 미할당 수량이 있으면 정산을 막는다. |
 
 ---
 
 ## 0. 요약
 
-| 항목 | 결정(제안) |
+| 항목 | 결정 |
 |---|---|
-| PG | **토스페이먼츠** 결제위젯 + 서버 승인(confirm) API |
-| 돈의 흐름 | 참여자(MEMBER)가 **자기 분담금**을 결제. 방장(HOST)은 결제 대상 아님 (선결제자) |
-| 금액 산정 | `room_items.actual_price` × (`alloc_quantity` / `total_qty`), 원 단위 내림, 잔액은 방장 부담 |
-| 금액 확정 시점 | 방장이 "정산 시작" 시 Redis 할당을 DB로 강제 동기화 후 **스냅샷**으로 고정 |
-| 정합성 | DB 상태 CAS(`UPDATE ... WHERE status = ?`) + Toss `Idempotency-Key` + 대사 스케줄러 |
-| 외부 호출 | **트랜잭션 밖에서** 호출 (DB 커넥션을 PG 응답 대기 동안 점유하지 않음) |
-| 신규 테이블 | `payments`, `settlement_lines` (DDL은 제안만, 실행은 승인 후) |
-<!-- 
-   1.방장도 결제 대상이야, 방장도 포함해서 결제해줘 
-   2. 
--->
+| 순서 | 모집·할당(`RECRUITING`) → **장보기 시작**(할당 잠금, `SHOPPING`) → 방장 장보기 → 실제 금액·수량 입력 → **정산 시작**(`SETTLING`) → MEMBER 이체 → 방장 입금 확인 → `COMPLETED` |
+| 할당 변경 | `RECRUITING`에서만 가능. **장보기 시작 이후에는 불가** |
+| 장보기 시작 조건 | 모든 품목 수량 = 할당 합계 + **MEMBER마다 전체 품목 중 최소 1개 품목은 할당**(일부 품목을 안 담는 것은 허용) |
+| 정산 시작 조건 | 모든 품목 실제가 입력 + 모든 품목 수량 = 할당 합계(덜 산 경우 수량을 줄였다면 다시 확인) |
+| 돈의 흐름 | 방장이 마트에서 전액 결제. MEMBER는 **방장 계좌로 직접 이체**(앱 밖). 앱은 금액 안내와 입금 확인 기록만 한다. |
+| 금액 산정 | `room_items.actual_price`(실제 구매가) × (`alloc_quantity` / `total_qty`), 원 단위 내림, **나머지는 방장 부담** |
+| 입금 확인 | 방장이 MEMBER별로 `PAID` 체크(정산 중에는 해제 가능). MEMBER 전원 `PAID`이면 `COMPLETED`. **`COMPLETED`는 되돌릴 수 없다.** |
+| 방장 계좌 | 정산 시작 때 방장이 입력하고 **Redis에 TTL 7일**로 저장. `COMPLETED`/정산 취소 시 삭제 |
+| 예외 처리 | 정산 컨트롤러 전용 `@RestControllerAdvice`. **기존 API는 건드리지 않음**(§7) |
+| 범위 | **MVP만** 구현. 나머지는 §12 "2차 구현" |
+| DB 변경 | **없음** (`rooms.status` 값만 늘어나며 컬럼 변경 불필요) |
 
-## 1. 현재 코드베이스 분석 (결제와 맞물리는 지점)
+**만들지 않는 것**: PG 결제. 그 밖에 미룬 기능은 §12 "2차 구현"에 정리.
 
-| 위치 | 현재 상태 | 결제 기능에 주는 영향 |
+**MVP에 남긴 것 중 빼지 않은 이유**: "할당 다시 열기"와 "정산 취소"는 각각 상태 전환 하나짜리라 작다. 빼면 품절(덜 산 경우)이나 실제가 오타가 났을 때 **틀린 금액을 고칠 방법이 없어** 남겼다.
+
+---
+
+## 1. 현재 코드베이스 분석 (정산과 맞물리는 지점)
+
+| 위치 | 현재 상태 | 정산 기능에 주는 영향 |
 |---|---|---|
-| `room_participants.settlement_status` | `DEFAULT 'UNPAID'`, 갱신 로직 없음 | 결제 완료 시 `PAID`로 갱신하는 데 재사용 |
-| `rooms.status` | `DEFAULT 'RECRUITING'`, 전이 로직 없음 | 정산 단계(`SETTLING`) 및 완료(`COMPLETED`) 상태 추가 필요 |
-| `room_items.actual_price` | `NOT NULL DEFAULT 0`, 입력 API 없음 | 방장이 실제 구매가를 입력하는 API 필요 |
-| `participant_items.alloc_quantity` | **Redis(`zset:{itemId}`)가 원본**, `SyncScheduler`가 30초 주기로 DB 반영 | 금액 산정 직전 DB가 최신이 아닐 수 있음 → **강제 flush + 할당 잠금** 필수 |
-| `RoomParticipantServiceImpl.allocateItem` | 방 상태 검사 없음 | 정산 시작 후에도 할당 변경 가능 → 상태 검사 추가 |
-| `RoomMapper.findRoomById` | `status` 컬럼을 조회하지 않음, `RoomVO`에 `status` 필드 없음 | VO/쿼리에 `status` 추가 |
-| 예외 처리 | `@RestControllerAdvice` 없음, `IllegalArgument/IllegalStateException` 사용 | 결제 오류는 응답 코드 구분이 중요 → 전역 핸들러 도입 제안 (§9) |
-| `ParticipantItemMapper`, `RoomItemMapper`, `RoomParticipantMapper` | `@Param`을 `org.springframework.data.repository.query.Param`에서 import | MyBatis가 인식하지 못함(현재는 `-parameters` 컴파일 옵션 덕에 우연히 동작). 신규 Mapper는 `org.apache.ibatis.annotations.Param` 사용 |
-| `application.yaml` | `optional:classpath:application-secret.yaml` import | Toss 시크릿 키는 여기에 둔다 (.gitignore 대상 확인 완료) |
+| `room_participants.settlement_status` | `DEFAULT 'UNPAID'`, 갱신 로직 없음 | 방장 입금 확인 시 `PAID`로 갱신하는 데 그대로 재사용 |
+| `rooms.status` | `DEFAULT 'RECRUITING'`, 전이 로직 없음 | `SHOPPING`, `SETTLING`, `COMPLETED` 전이 추가 |
+| `room_items.actual_price` | `NOT NULL DEFAULT 0`, 입력 API 없음 | 기존 품목 수정 API에 `actualPrice` 추가 |
+| `PATCH /api/rooms/{roomId}/items/{roomItemId}` (`RoomItemServiceImpl.updateItemDetails`) | 방장 권한 검사 있음. `unit`, `stepQty`, `totalQty` 수정. 방 상태 검사 없음 | 실제가 입력과 덜 산 경우 수량 수정에 재사용. 상태 검사 추가 |
+| `participant_items.alloc_quantity` | **Redis(`zset:{itemId}`)가 원본**, `SyncScheduler`가 30초 주기로 DB 반영 | 장보기 시작 시 DB가 최신이 아닐 수 있음 → **강제 flush + 할당 잠금** 필수 |
+| `RoomParticipantServiceImpl.allocateItem` | 방 상태 검사 없음 | `RECRUITING` 외에는 할당 차단 |
+| `RoomMapper.findRoomById` | `status`를 조회하지 않음, `RoomVO`에 `status` 없음 | VO와 쿼리에 `status` 추가 |
+| 방 나가기 / 강퇴 API | **없음** | 만들 때 상태 조건 포함(§6.8). 할당 0개 MEMBER 해소 수단이 "할당하기"뿐인 점 참고 |
+| 예외 처리 | `@RestControllerAdvice` 없음, `IllegalArgument/IllegalStateException` 사용 | 정산 컨트롤러 전용 핸들러만 추가(§7). 기존 API는 그대로 |
+| `ParticipantItemMapper`, `RoomItemMapper`, `RoomParticipantMapper` | `@Param`을 `org.springframework.data.repository.query.Param`에서 import | 신규 Mapper 메서드는 `org.apache.ibatis.annotations.Param` 사용 |
 
 ---
 
 ## 2. 전체 흐름
 
 ```
-[방장]                          [서버]                                  [참여자]                [Toss]
-  │ 1. 실제가 입력 (PATCH price)   │                                        │                      │
-  │ 2. 정산 시작 (POST settle) ───▶│ 방 상태 RECRUITING→SETTLING (CAS)       │                      │
-  │                               │ Redis 할당 → DB 강제 flush              │                      │
-  │                               │ 분담금 계산 → settlement_lines 스냅샷   │                      │
-  │                               │                                        │                      │
-  │                               │◀── 3. 결제 준비 (POST prepare) ─────────│                      │
-  │                               │ payments READY 생성, orderId 발급 ─────▶│                      │
-  │                               │                                        │ 4. 결제위젯 ────────▶│
-  │                               │                                        │◀─ successUrl redirect│
-  │                               │◀── 5. 승인 요청 (POST confirm) ─────────│ (paymentKey,orderId,amount)
-  │                               │ 금액 검증 → READY→IN_PROGRESS (CAS)     │                      │
-  │                               │ ── 6. /v1/payments/confirm ────────────────────────────────▶│
-  │                               │ ◀─────────────────────────────────────────────────── 결과 ──│
-  │                               │ DONE + participant PAID (tx)           │                      │
-  │                               │ 모든 MEMBER PAID → room COMPLETED      │                      │
-  │                               │                                        │                      │
-  │                               │◀── 7. 웹훅 / 대사 스케줄러 (IN_PROGRESS 정리) ─────────────────│
+[방장]                                    [서버]                                  [MEMBER]
+  │                                         │◀────────── 할당 (기존 allocate) ─────────│
+  │ 1. 장보기 시작 (POST shopping) ─────────▶│ RECRUITING→SHOPPING (CAS)               │
+  │                                         │ 할당 잠금 → Redis→DB flush               │
+  │                                         │ 검증(수량=할당, 0개 MEMBER 없음) 실패 시 롤백│
+  │ 2. 장보기 (앱 밖, 마트에서 전액 결제)     │                                        │
+  │ 3. 실제가·수량 입력 (기존 PATCH item) ──▶│ SHOPPING에서 허용                        │
+  │ 4. 정산 시작 + 계좌 입력 (POST) ────────▶│ SHOPPING→SETTLING (CAS)                 │
+  │                                         │ 검증(실제가, 수량=할당) 실패 시 롤백       │
+  │                                         │ 계좌 → Redis (TTL 7일)                   │
+  │                                         │── 5. 내 분담금 + 방장 계좌 (GET) ───────▶│
+  │                                         │                                        │ 6. 은행 앱으로 이체 (앱 밖)
+  │ 7. 입금 확인 체크 (PATCH, MEMBER별) ────▶│ UNPAID→PAID                             │
+  │                                         │ MEMBER 전원 PAID → COMPLETED, 계좌 삭제  │
 ```
 
 ### 상태 머신
 
 **rooms.status**
 ```
-RECRUITING ──settle──▶ SETTLING ──모든 MEMBER 결제──▶ COMPLETED
-     │                    │
-     └──────cancel────────┴──▶ CANCELED  (정산 전 취소 / 전원 환불 시)
+            장보기 시작               정산 시작                 MEMBER 전원 PAID
+RECRUITING ───────────▶ SHOPPING ───────────▶ SETTLING ─────────────────▶ COMPLETED (최종)
+     ▲                    │  ▲                   │
+     └──할당 다시 열기────┘  └──정산 취소(PAID 없음)┘
+(각 전이의 검증이 실패하면 롤백되어 이전 상태 유지)
 ```
 
-**payments.status**
+**room_participants.settlement_status** (MEMBER만 의미 있음)
 ```
-READY ──confirm 요청──▶ IN_PROGRESS ──Toss 성공──▶ DONE ──cancel──▶ CANCELED
-  │                        │
-  │                        ├──Toss 실패(명확)──▶ FAILED
-  │                        └──타임아웃/5xx──▶ (IN_PROGRESS 유지, 대사 스케줄러가 확정)
-  └──30분 경과──▶ EXPIRED
+UNPAID ◀──방장 체크/해제──▶ PAID     (SETTLING 동안만 변경 가능, COMPLETED 이후 고정)
 ```
+
+| 상태 | 할당 | 품목 수정(가격·수량) | 방 참여 | 방 나가기 |
+|---|---|---|---|---|
+| `RECRUITING` | 가능 | 가능 | 가능 | 가능 |
+| `SHOPPING` | **불가** | 가능(방장, 실제가·덜 산 수량 입력) | 불가 | 불가 |
+| `SETTLING` | 불가 | 불가 | 불가 | 불가 |
+| `COMPLETED` | 불가 | 불가 | 불가 | 가능 |
 
 ---
 
-## 3. DB 설계 (DDL 제안 — **실행하지 않음, 승인 후 반영**)
+## 3. 데이터 저장
 
-```sql
--- rooms.status 값 확장: RECRUITING | SETTLING | COMPLETED | CANCELED (컬럼 변경 불필요)
+**DB 변경 없음.** `rooms.status`에 `SHOPPING`, `SETTLING`, `COMPLETED` 값만 새로 쓴다(VARCHAR라 DDL 불필요). `schema.sql`은 변경하지 않는다.
 
-CREATE TABLE `settlement_lines`
-(
-    `id`             BIGINT    NOT NULL AUTO_INCREMENT,
-    `room_id`        BIGINT    NOT NULL,
-    `participant_id` BIGINT    NOT NULL,
-    `item_id`        BIGINT    NOT NULL,
-    `alloc_quantity` INT       NOT NULL,
-    `total_qty`      INT       NOT NULL,
-    `item_price`     INT       NOT NULL,   -- 스냅샷 시점 actual_price
-    `amount`         INT       NOT NULL,   -- 이 품목에 대한 참여자 분담금(원)
-    `created_at`     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (`id`),
-    UNIQUE KEY `UK_settlement_line` (`participant_id`, `item_id`),
-    KEY `IDX_settlement_room` (`room_id`),
-    CONSTRAINT `FK_settle_rooms` FOREIGN KEY (`room_id`) REFERENCES `rooms` (`id`),
-    CONSTRAINT `FK_settle_participants` FOREIGN KEY (`participant_id`) REFERENCES `room_participants` (`id`),
-    CONSTRAINT `FK_settle_items` FOREIGN KEY (`item_id`) REFERENCES `room_items` (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+| 데이터 | 저장 위치 | 이유 |
+|---|---|---|
+| 분담금 | 저장 안 함. 조회 시 계산 | `SETTLING` 이후에는 할당과 품목 수정이 모두 막혀 입력이 고정됨 → 항상 같은 결과. 정산 취소 후에는 가격이 바뀔 수 있지만, 재정산 시 다시 계산하면 됨 |
+| 방장 계좌 | Redis `room:account:{roomId}` (Hash: `bankName`, `accountNumber`, `accountHolder`), **TTL 7일** | 방마다 입력하는 일회성 정보 → DB에 개인정보를 남기지 않음. `COMPLETED`/정산 취소 시 즉시 삭제 |
 
-CREATE TABLE `payments`
-(
-    `id`             BIGINT       NOT NULL AUTO_INCREMENT,
-    `order_id`       VARCHAR(64)  NOT NULL,              -- 서버 발급 UUID (Toss orderId)
-    `payment_key`    VARCHAR(200)          DEFAULT NULL, -- Toss 발급, confirm 이후 세팅
-    `room_id`        BIGINT       NOT NULL,
-    `participant_id` BIGINT       NOT NULL,
-    `user_id`        BIGINT       NOT NULL,
-    `amount`         INT          NOT NULL,
-    `order_name`     VARCHAR(100) NOT NULL,
-    `status`         VARCHAR(20)  NOT NULL DEFAULT 'READY',
-    `method`         VARCHAR(30)           DEFAULT NULL,
-    `fail_code`      VARCHAR(100)          DEFAULT NULL,
-    `fail_message`   VARCHAR(500)          DEFAULT NULL,
-    `approved_at`    TIMESTAMP NULL        DEFAULT NULL,
-    `canceled_at`    TIMESTAMP NULL        DEFAULT NULL,
-    `created_at`     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    `updated_at`     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (`id`),
-    UNIQUE KEY `UK_payments_order_id` (`order_id`),
-    UNIQUE KEY `UK_payments_payment_key` (`payment_key`),
-    KEY `IDX_payments_participant_status` (`participant_id`, `status`),
-    KEY `IDX_payments_status_updated` (`status`, `updated_at`),  -- 대사 스케줄러용
-    CONSTRAINT `FK_payments_rooms` FOREIGN KEY (`room_id`) REFERENCES `rooms` (`id`),
-    CONSTRAINT `FK_payments_participants` FOREIGN KEY (`participant_id`) REFERENCES `room_participants` (`id`),
-    CONSTRAINT `FK_payments_users` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-```
-
-설계 근거
-- **금액은 `INT`(원)**: KRW는 소수점이 없고, `room_items` 가격도 `INT`. 부동소수 사용 금지.
-- **`settlement_lines` 스냅샷**: 결제 후 방장이 가격/할당을 바꿔도 결제 근거가 보존됨. 분쟁 대응용 영수증 상세 화면에도 사용.
-- **참여자당 활성 결제 1건**: MySQL은 partial unique index가 없어 DB 제약 대신 `prepare` 시 `SELECT ... FOR UPDATE`로 보장(§6.2).
+- shortcut: 계좌 키가 TTL 만료나 Redis 장애로 사라지면 조회 시 계좌가 비어 있다. MVP에서는 방장이 MEMBER에게 직접 알려준다. 재입력 API나 DB 저장은 2차(§12).
+- **금액은 `INT`(원)**: KRW는 소수점이 없다. 부동소수는 사용하지 않는다.
 
 ---
 
 ## 4. 분담금 계산 규칙
 
 ```
-참여자 p의 분담금 = Σ_item floor(actual_price × alloc_qty(p) / total_qty)
-방장 부담금       = Σ_item actual_price − Σ_MEMBER 분담금   (내림 잔액 + 미할당분 포함)
+참여자 p의 품목별 기본 금액 = floor(actual_price × alloc_qty(p) / total_qty)
+품목별 나머지              = actual_price − Σ_p 기본 금액      (0 ≤ 나머지 < 할당자 수)
+방장 품목별 금액           = 방장 기본 금액 + 품목별 나머지
+참여자 p의 분담금          = Σ_item 품목별 금액(p)
 ```
+- 미할당이 없으므로 **Σ 전 참여자 분담금 == Σ actual_price**가 항상 성립한다(단위 테스트로 검증).
+- MEMBER 분담금만 송금 대상이다. 방장 분담금은 "내 몫"으로 표시만 한다. 방장이 받을 금액은 Σ MEMBER 분담금이다.
+- **나머지는 방장 부담**(확정): MEMBER가 1원도 더 내지 않고, 결과가 결정적이다. 방장이 그 품목을 할당받지 않았어도 방장 몫에 더한다.
 
-- **내림 잔액은 방장이 부담**: 참여자가 1원이라도 더 내는 상황을 막는 게 분쟁이 적음.
-- **미할당 수량**(`Σ alloc < total_qty`)도 방장 몫. 정산 시작 시 경고 응답(`unallocatedItems`)으로 알려준다.
-- 금액 0원인 MEMBER는 결제 생략, 바로 `PAID` 처리.
-- `actual_price = 0` 인 품목이 있으면 정산 시작 거부 (입력 누락 방지).
-- Toss 최소 결제금액(100원) 미만이면 결제 생략 + `PAID` 처리 (검토 필요, §12).
+**차단 조건** (해당하면 거부하고, 상태는 이전 그대로)
+
+| 시점 | 조건 | 에러 코드 | 응답 상세 | 해결 |
+|---|---|---|---|---|
+| 장보기 시작 | `Σ alloc ≠ total_qty` 품목 | `UNALLOCATED_ITEMS` | 품목별 `totalQty`, `allocatedQty` | 남은 수량을 할당하거나, 방장이 품목 수량을 할당량에 맞게 수정 |
+| 장보기 시작 | **모든 품목**에서 할당이 0인 MEMBER (일부 품목만 0인 것은 통과) | `MEMBER_WITHOUT_ITEMS` | 참여자 id/닉네임 | 해당 MEMBER가 아무 품목이나 1개 이상 할당 |
+| 정산 시작 | `actual_price = 0` 품목 | `PRICE_NOT_SET` | 품목 id/이름 | 방장이 실제가 입력 |
+| 정산 시작 | `Σ alloc ≠ total_qty` 품목 (덜 사서 수량을 줄인 경우) | `UNALLOCATED_ITEMS` | 품목별 `totalQty`, `allocatedQty` | 아래 "덜 산 경우" 참고 |
+
+**덜 산 경우 (품절 등)**
+- 방장이 `SHOPPING`에서 기존 품목 수정 API로 `totalQty`를 실제 구매 수량으로 줄이고 실제가를 입력한다.
+- 그러면 할당 합계가 수량보다 많아져 정산 시작이 거부된다. 할당은 잠겨 있으므로, 방장이 **할당 다시 열기**(`SHOPPING → RECRUITING`)를 하고 MEMBER가 수량을 줄인 뒤 다시 장보기 시작 → 정산 시작을 한다.
+  - shortcut: 다시 열면 모든 MEMBER가 할당을 바꿀 수 있다. 덜 사는 일이 잦으면 "방장이 할당을 직접 조정하는 API"를 추가한다.
+- 가격과 수량은 **같은 구매량 기준**이어야 한다(분담 단가 = `actual_price / total_qty`). 실제가만 줄이고 수량을 그대로 두면 MEMBER가 덜 내고 방장이 손해 본다. 품목 수정 화면에서 "실제 구매 수량·금액"을 함께 입력받도록 안내한다.
+
+**아무 품목도 안 담은 MEMBER**: 판정 기준은 "MEMBER별 전체 품목 할당 합계 = 0"이다. 특정 품목을 안 담는 것은 정상이고, 전체 품목 중 하나라도 담으면 통과한다. 장보기 시작에서 막으므로 정산 단계에는 존재하지 않는다. 다만 지금은 방 나가기와 강퇴 API가 없어서 해소 방법이 "해당 MEMBER가 할당하기" 하나뿐이다.
 
 ```java
-// domain/payment/service/SettlementCalculator.java — 순수 계산 로직(단위 테스트 용이)
+// domain/settlement/service/SettlementCalculator.java: 순수 계산(단위 테스트 용이)
 @Component
 public class SettlementCalculator {
 
-    public List<SettlementLineVO> calculate(Long roomId,
-                                            List<RoomItemVO> items,
-                                            List<ParticipantItemVO> allocations) {
-        Map<Long, RoomItemVO> itemById = items.stream()
-                .collect(Collectors.toMap(RoomItemVO::getId, Function.identity()));
+    public SettlementResult calculate(Long hostParticipantId,
+                                      List<Long> participantIds,       // HOST 포함
+                                      List<RoomItemVO> items,
+                                      List<ParticipantItemVO> allocations) {
+        Map<Long, List<ParticipantItemVO>> allocByItem = allocations.stream()
+                .filter(a -> a.getAllocQuantity() > 0)
+                .collect(Collectors.groupingBy(ParticipantItemVO::getItemId));
 
-        List<SettlementLineVO> lines = new ArrayList<>();
-        for (ParticipantItemVO alloc : allocations) {
-            RoomItemVO item = itemById.get(alloc.getItemId());
-            if (item == null || alloc.getAllocQuantity() <= 0) continue;
+        List<SettlementLine> lines = new ArrayList<>();
+        List<UnallocatedItem> unallocated = new ArrayList<>();
 
-            // long 연산으로 오버플로 방지 후 원 단위 내림
-            long amount = (long) item.getActualPrice() * alloc.getAllocQuantity() / item.getTotalQty();
+        for (RoomItemVO item : items) {
+            List<ParticipantItemVO> allocs = allocByItem.getOrDefault(item.getId(), List.of());
+            int allocated = allocs.stream().mapToInt(ParticipantItemVO::getAllocQuantity).sum();
+            if (allocated != item.getTotalQty()) {
+                unallocated.add(new UnallocatedItem(item.getId(), item.getTotalQty(), allocated));
+                continue;
+            }
 
-            lines.add(SettlementLineVO.builder()
-                    .roomId(roomId)
-                    .participantId(alloc.getParticipantId())
-                    .itemId(item.getId())
-                    .allocQuantity(alloc.getAllocQuantity())
-                    .totalQty(item.getTotalQty())
-                    .itemPrice(item.getActualPrice())
-                    .amount(Math.toIntExact(amount))
-                    .build());
+            long floorSum = 0;
+            for (ParticipantItemVO a : allocs) {
+                long amount = (long) item.getActualPrice() * a.getAllocQuantity() / item.getTotalQty(); // long: 오버플로 방지
+                floorSum += amount;
+                lines.add(new SettlementLine(a.getParticipantId(), item.getId(), a.getAllocQuantity(), Math.toIntExact(amount), 0));
+            }
+            int remainder = Math.toIntExact(item.getActualPrice() - floorSum);
+            if (remainder > 0) {
+                lines.add(new SettlementLine(hostParticipantId, item.getId(), 0, remainder, remainder)); // 나머지는 방장 부담
+            }
         }
-        return lines;
+
+        Map<Long, Integer> totals = participantIds.stream().collect(Collectors.toMap(Function.identity(), id -> 0));
+        lines.forEach(l -> totals.merge(l.participantId(), l.amount(), Integer::sum));
+        return new SettlementResult(lines, totals, unallocated);
     }
 }
+
+// DB 테이블과 매핑되지 않으므로 VO가 아닌 DTO(record)
+public record SettlementLine(Long participantId, Long itemId, int allocQuantity, int amount, int roundingAdjustment) {}
 ```
+> 장보기 시작 검증은 가격 없이 수량만 보면 되므로 `unallocated`만 사용한다. 할당 0개 MEMBER는 `allocations`에서 MEMBER별 합계로 따로 검사한다.
 
 ---
 
 ## 5. 패키지 구조
 
 ```
-domain/payment/
-├── controller/
-│   ├── PaymentController.java          # prepare / confirm / fail / cancel / 조회
-│   └── PaymentWebhookController.java   # Toss 웹훅 (permitAll)
+domain/settlement/
+├── controller/SettlementController.java     # 장보기 시작/할당 다시 열기, 정산 시작/조회/입금 확인/취소
 ├── service/
-│   ├── SettlementService(.Impl).java   # 정산 시작: 잠금 → flush → 계산 → 스냅샷
-│   ├── SettlementCalculator.java
-│   ├── PaymentService(.Impl).java      # prepare / confirm / cancel 오케스트레이션 (트랜잭션 없음)
-│   └── PaymentTxService.java           # 짧은 DB 트랜잭션 단위 모음
-├── client/
-│   ├── TossPaymentsClient.java         # RestClient 래퍼
-│   ├── TossPaymentsProperties.java     # @ConfigurationProperties("toss.payments")
-│   └── TossPaymentResponse.java / TossErrorResponse.java
-├── scheduler/
-│   └── PaymentReconcileScheduler.java  # IN_PROGRESS 대사, READY 만료
+│   ├── SettlementService(.Impl).java
+│   └── SettlementCalculator.java
 ├── exception/
-│   └── PaymentException.java, PaymentErrorCode.java
-└── model/
-    ├── dto/PaymentDto.java, SettlementDto.java
-    ├── mapper/PaymentMapper.java, SettlementLineMapper.java
-    └── vo/PaymentVO.java, SettlementLineVO.java, PaymentStatus.java
-resources/mappers/payment/paymentMapper.xml, settlementLineMapper.xml
+│   ├── SettlementValidationException.java   # 에러 코드 + 상세 목록
+│   └── SettlementExceptionHandler.java      # SettlementController 전용
+└── model/dto/SettlementDto.java             # AccountRequest, SettlementResponse, SettlementLine, ...
 ```
-
-> `PaymentService`와 `PaymentTxService`를 분리하는 이유: 같은 클래스 내부 호출은 프록시를 타지 않아 `@Transactional`이 적용되지 않는다(self-invocation). 외부 HTTP 호출 앞뒤를 **각각 독립된 짧은 트랜잭션**으로 묶으려면 빈을 나눠야 한다.
+신규 Mapper 없음. 기존 `RoomMapper`, `RoomItemMapper`, `ParticipantItemMapper`, `RoomParticipantMapper`에 메서드만 추가(§8).
 
 ---
 
 ## 6. 단계별 구현
 
-### 6.1 Phase 1 — 정산 시작 (금액 확정)
+### 6.1 API
 
-**API**
-| Method | Path | 권한 | 설명 |
-|---|---|---|---|
-| PATCH | `/api/rooms/{roomId}/items/{itemId}/price` | HOST | 실제 구매가 입력 (`RECRUITING`에서만) |
-| POST | `/api/rooms/{roomId}/settlement` | HOST | 정산 시작 → 분담금 확정 |
-| GET | `/api/rooms/{roomId}/settlement` | 참여자 | 내 분담금 + 품목별 상세 |
+| Method | Path | 권한 | Req | Res | 주요 에러 |
+|---|---|---|---|---|---|
+| PATCH | `/api/rooms/{roomId}/items/{roomItemId}` (**기존**) | HOST | 기존 `{unit, stepQty, totalQty}` + `actualPrice` | 200 | 403, 409(`RECRUITING`/`SHOPPING` 아님) |
+| POST | `/api/rooms/{roomId}/shopping` | HOST | - | 200 | 403, 409(`RECRUITING` 아님), 400(`UNALLOCATED_ITEMS` / `MEMBER_WITHOUT_ITEMS` + 상세) |
+| DELETE | `/api/rooms/{roomId}/shopping` | HOST | - | 200 | 403, 409(`SHOPPING` 아님) |
+| POST | `/api/rooms/{roomId}/settlement` | HOST | `{bankName, accountNumber, accountHolder}` | `SettlementResponse` | 403, 409(`SHOPPING` 아님), 400(`PRICE_NOT_SET` / `UNALLOCATED_ITEMS` + 상세) |
+| GET | `/api/rooms/{roomId}/settlement` | 참여자 | - | MEMBER: 내 분담금 + 품목별 내역 + 방장 계좌 + 내 상태 / HOST: 내 몫 + MEMBER별 금액·상태 + 받을 총액 | 403, 409(정산 전) |
+| PATCH | `/api/rooms/{roomId}/participants/{participantId}/settlement-status` | HOST | `{status: "PAID" \| "UNPAID"}` | 200 | 403, 409(`SETTLING` 아님), 400(HOST 대상) |
+| DELETE | `/api/rooms/{roomId}/settlement` | HOST | - | 200 | 403, 409(`SETTLING` 아님 / `PAID` MEMBER 있음) |
 
-**핵심 문제: Redis 할당과의 경합**
-`allocateItem`은 Redis Lua로 즉시 반영되고 DB는 최대 30초 뒤 반영된다. 정산 시작 순간에 할당이 들어오면 스냅샷과 실제가 어긋난다. 해결 순서:
+### 6.2 기존 품목 수정 API 보강 (`RoomItemServiceImpl.updateItemDetails`)
+- 방 상태가 `RECRUITING` 또는 `SHOPPING`이 아니면 거부(정산 중 가격·수량 변경 차단 → 조회 시 계산 결과 고정)
+- `actualPrice`는 0 이상 정수(0 = 미입력)
+- 기존 `updateItemDetails` 쿼리에 `actual_price = #{actualPrice}` 추가
+- `alloc.lua`는 매 호출마다 DB `totalQty`를 cap으로 받으므로 수량을 바꿔도 Redis 쪽은 따로 갱신하지 않아도 된다.
 
-1. **DB 상태 CAS**로 `RECRUITING → SETTLING` (동시에 두 번 눌러도 한 번만 성공)
-2. **Redis 잠금 키** `room:locked:{roomId}` 세팅 → `alloc.lua`가 이 키를 보고 거부
-3. 해당 방 품목들의 `zset:{itemId}`를 **직접 읽어 DB upsert** (스케줄러를 기다리지 않음)
-4. DB에서 할당/가격을 읽어 계산 → `settlement_lines` insert
+### 6.3 장보기 시작: 할당 잠금 (Redis 경합 처리)
+
+`allocateItem`은 Redis Lua로 즉시 반영되고 DB 반영은 최대 30초 늦다. 장보기 시작 순간의 할당을 정확히 고정하는 순서는 다음과 같다.
+
+1. **DB 상태 CAS** `RECRUITING → SHOPPING` (동시 요청 중 하나만 통과)
+2. **Redis 잠금 키** `room:locked:{roomId}` 세팅 → `alloc.lua`가 거부
+3. 방 품목들의 `zset:{itemId}`를 **직접 읽어 DB upsert** (스케줄러를 기다리지 않음)
+4. 검증(수량 = 할당, 할당 0개 MEMBER 없음). 실패하면 예외 → 롤백(`RECRUITING` 복귀) + 롤백 훅에서 잠금 해제
 
 ```lua
 -- scripts/alloc.lua 수정: KEYS[5] = room:locked:{roomId}
@@ -249,98 +247,120 @@ end
 ```
 
 ```java
-// RoomParticipantServiceImpl.allocateItem — 추가
+// RoomParticipantServiceImpl.allocateItem: 추가
 private static final long ROOM_LOCKED = -4L;
 ...
+// 진입부: room.status가 RECRUITING이 아니면 거부 (잠금 키 TTL 만료 대비 이중 차단)
 List.of(dedupKey, zsetKey, totalKey, DIRTY_SET_KEY, "room:locked:" + roomId)
 ...
 if (result == ROOM_LOCKED) {
-    throw new IllegalStateException("정산이 시작되어 수량을 변경할 수 없습니다.");
+    throw new IllegalStateException("장보기가 시작되어 수량을 변경할 수 없습니다.");
 }
 ```
 
-> 잠금 키 TTL: CLAUDE.md 규칙상 TTL 필수 → `7일`(zset TTL과 동일). 만료 후에도 DB `rooms.status`가 `SETTLING`이므로 `allocateItem` 진입부에서 상태를 한 번 더 검사해 이중으로 막는다.
-
 ```java
-// SettlementServiceImpl.java
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class SettlementServiceImpl implements SettlementService {
-    private static final Duration ROOM_LOCK_TTL = Duration.ofDays(7);
+// SettlementServiceImpl.startShopping
+@Transactional
+public void startShopping(Long roomId, String email) {
+    getRoomAsHost(roomId, email); // 사용자·방 존재, 방장 여부 확인
+    List<RoomItemVO> items = roomItemMapper.findRoomItemsByRoomId(roomId);
 
-    private final UserMapper userMapper;
-    private final RoomMapper roomMapper;
-    private final RoomItemMapper roomItemMapper;
-    private final ParticipantItemMapper participantItemMapper;
-    private final SettlementLineMapper settlementLineMapper;
-    private final SettlementCalculator calculator;
-    private final AllocationFlusher allocationFlusher; // SyncScheduler.syncItem 로직을 분리한 컴포넌트
-    private final StringRedisTemplate redisTemplate;
-
-    @Transactional
-    public SettlementDto.StartResponse startSettlement(Long roomId, String email) {
-        UserVO user = userMapper.findByEmail(email);
-        if (user == null) throw new IllegalArgumentException("존재하지 않는 사용자입니다.");
-
-        RoomVO room = roomMapper.findRoomById(roomId);
-        if (room == null) throw new IllegalArgumentException("존재하지 않는 방입니다.");
-        if (!user.getId().equals(room.getHostId())) {
-            throw new IllegalStateException("방장만 정산을 시작할 수 있습니다.");
-        }
-
-        List<RoomItemVO> items = roomItemMapper.findRoomItemsByRoomId(roomId);
-        validateItems(items); // actual_price > 0, total_qty > 0
-
-        // 1) 상태 CAS — 동시 요청 중 하나만 통과
-        if (roomMapper.updateStatus(roomId, "RECRUITING", "SETTLING") == 0) {
-            throw new IllegalStateException("이미 정산이 시작되었거나 정산할 수 없는 방입니다.");
-        }
-
-        // 2) Redis 할당 잠금 (이후 alloc.lua가 -4 반환)
-        redisTemplate.opsForValue().set("room:locked:" + roomId, "1", ROOM_LOCK_TTL);
-
-        // 3) Redis → DB 강제 동기화 (스케줄러 주기와 무관하게 최신화)
-        for (RoomItemVO item : items) {
-            allocationFlusher.flush(item.getId());
-        }
-
-        // 4) 계산 + 스냅샷
-        List<ParticipantItemVO> allocations = participantItemMapper.findByRoomId(roomId);
-        List<SettlementLineVO> lines = calculator.calculate(roomId, items, allocations);
-        if (!lines.isEmpty()) {
-            settlementLineMapper.insertBatch(lines);
-        }
-
-        log.info("정산 시작: roomId={}, lines={}", roomId, lines.size());
-        return SettlementDto.StartResponse.of(lines, items, allocations, room.getHostId());
+    if (roomMapper.updateStatus(roomId, "RECRUITING", "SHOPPING") == 0) {
+        throw new IllegalStateException("모집 중인 방이 아닙니다.");
     }
+
+    registerLockRollback(roomId, items); // 롤백 시 잠금 해제 + dirty set 재등록
+    redisTemplate.opsForValue().set("room:locked:" + roomId, "1", ROOM_LOCK_TTL);
+
+    items.forEach(item -> allocationFlusher.flush(item.getId()));
+
+    validateAllocations(roomId, items); // UNALLOCATED_ITEMS, MEMBER_WITHOUT_ITEMS
+    log.info("장보기 시작: roomId={}", roomId);
 }
 ```
 
-> **Redis 잠금은 DB 트랜잭션 롤백 대상이 아니다.** 4)에서 예외가 나 롤백되면 잠금 키가 남는다. `TransactionSynchronization.afterCompletion`에서 롤백 시 `DEL room:locked:{roomId}` 하도록 등록한다.
+> **Redis 작업은 DB 롤백 대상이 아니다.** `TransactionSynchronization.afterCompletion(ROLLED_BACK)`에서 `DEL room:locked:{roomId}`를 실행하고, flush한 품목을 dirty set에 다시 넣는다(flush의 DB upsert도 롤백되므로 스케줄러가 다시 동기화하게).
+>
+> **잠금 키 TTL 7일**(CLAUDE.md 규칙상 TTL 필수, zset TTL과 동일). 만료돼도 `allocateItem` 진입부의 상태 검사로 이중 차단한다.
+>
+> 검증 실패는 정상 흐름이므로 `INFO`로 로깅한다.
+
+**할당 다시 열기** (`DELETE .../shopping`, `SHOPPING → RECRUITING`): 덜 사서 할당을 줄여야 할 때 쓴다. CAS 성공 후 커밋되면 `DEL room:locked:{roomId}`.
+
+**AllocationFlusher**: 현재 `SyncScheduler.syncItem(String)`이 private이라 재사용할 수 없다 → 컴포넌트로 추출하고 `SyncScheduler`도 이를 호출하게 리팩터링한다. 동작 변경 없음.
+
+### 6.4 정산 시작
+할당은 장보기 시작 때 이미 DB에 고정됐으므로 flush나 잠금은 필요 없다.
 
 ```java
-TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-    @Override
-    public void afterCompletion(int status) {
-        if (status == STATUS_ROLLED_BACK) {
-            redisTemplate.delete("room:locked:" + roomId);
-        }
+@Transactional
+public SettlementDto.SettlementResponse startSettlement(Long roomId, String email, SettlementDto.AccountRequest account) {
+    getRoomAsHost(roomId, email);
+    if (roomMapper.updateStatus(roomId, "SHOPPING", "SETTLING") == 0) {
+        throw new IllegalStateException("장보기 중인 방이 아닙니다.");
     }
-});
+    SettlementResult result = calculate(roomId);
+    validate(result); // PRICE_NOT_SET, UNALLOCATED_ITEMS → 예외 → 롤백(SHOPPING 유지)
+
+    afterCommit(() -> saveAccount(roomId, account)); // Redis Hash + TTL 7일. 롤백 시 저장 안 됨
+    log.info("정산 시작: roomId={}", roomId);           // 계좌번호는 로그에 남기지 않음
+    return SettlementDto.SettlementResponse.forHost(result, account);
+}
 ```
 
-**AllocationFlusher**: 현재 `SyncScheduler.syncItem(String)`이 private이라 재사용 불가 → `room/scheduler/AllocationFlusher`(또는 `room/service`)로 추출하고 `SyncScheduler`도 이를 호출하도록 리팩터링. 동작 변경 없음.
+### 6.5 정산 조회
+- 참여자 확인 → 방 상태가 `SETTLING`/`COMPLETED`가 아니면 409
+- DB에서 품목·할당을 읽어 `SettlementCalculator`로 계산(입력이 고정되어 결과가 항상 같음)
+- MEMBER에게는 본인 금액, 내역, 방장 계좌, 본인 상태를 준다. HOST에게는 내 몫, MEMBER별 금액·상태, 받을 총액을 준다.
+- 방장 계좌는 **해당 방 참여자에게만**, `SETTLING` 동안만 반환한다. Redis에 없으면 `null`(MVP: "방장에게 계좌를 문의하세요" 안내).
 
-**추가 Mapper 메서드**
+### 6.6 입금 확인 (방장)
+```java
+@Transactional
+public void updateSettlementStatus(Long roomId, Long participantId, String email, String status) {
+    // 방장 확인, 상태 값 PAID/UNPAID만 허용
+    // 방 SETTLING 아니면 409 → COMPLETED 이후에는 체크 변경 불가(되돌릴 수 없음)
+    // 대상이 이 방의 MEMBER인지 확인 (HOST면 400)
+    roomParticipantMapper.updateSettlementStatus(participantId, status);
+    if ("PAID".equals(status) && roomParticipantMapper.countMembersByStatus(roomId, "UNPAID") == 0) {
+        if (roomMapper.updateStatus(roomId, "SETTLING", "COMPLETED") == 1) { // CAS라 동시 요청에도 1회
+            afterCommit(() -> redisTemplate.delete(List.of("room:account:" + roomId, "room:locked:" + roomId)));
+        }
+    }
+}
+```
+> `COMPLETED` 이후에는 `allocateItem`과 품목 수정이 상태 검사로 막히므로 잠금 키도 함께 지운다.
+
+### 6.7 정산 취소 (방장)
+잘못 입력한 실제가를 고치기 위해 `SETTLING → SHOPPING`으로 되돌린다. 할당 잠금은 유지된다.
+
+```java
+@Transactional
+public void cancelSettlement(Long roomId, String email) {
+    getRoomAsHost(roomId, email);
+    if (roomParticipantMapper.countMembersByStatus(roomId, "PAID") > 0) {
+        throw new IllegalStateException("입금 확인된 참여자가 있어 정산을 취소할 수 없습니다.");
+    }
+    if (roomMapper.updateStatus(roomId, "SETTLING", "SHOPPING") == 0) {
+        throw new IllegalStateException("정산 중인 방이 아닙니다.");
+    }
+    afterCommit(() -> redisTemplate.delete("room:account:" + roomId));
+}
+```
+- 방장이 아직 체크하지 않았을 뿐 이미 이체한 MEMBER가 있을 수 있다. 취소 화면에서 "이미 이체한 참여자와 따로 정리하세요"라고 안내한다.
+- shortcut: `PAID` 확인과 상태 변경 사이에 방장이 체크하면 경합이 생긴다. 두 요청 모두 방장 본인이 보내는 것이라 드물다. 문제가 되면 `updateStatus` 조건에 `NOT EXISTS (PAID MEMBER)`를 넣는다.
+
+### 6.8 방 참여·나가기 제약
+- 참여: `RECRUITING`에서만 (`increaseParticipants`에 `AND status = 'RECRUITING'`)
+- 나가기: 현재 API가 **없다**. 이번 범위에서 만들지 않는다. 만들 때는 `SHOPPING`/`SETTLING`이면 거부하고 `RECRUITING`/`COMPLETED`이면 허용한다.
+
+### 6.9 추가 Mapper 메서드
+
 ```xml
 <!-- roomMapper.xml -->
 <update id="updateStatus">
-    UPDATE `rooms`
-    SET status = #{toStatus}
-    WHERE id = #{roomId}
-      AND status = #{fromStatus}
+    UPDATE `rooms` SET status = #{toStatus}
+    WHERE id = #{roomId} AND status = #{fromStatus}
 </update>
 
 <!-- participantItemMapper.xml -->
@@ -350,400 +370,41 @@ TransactionSynchronizationManager.registerSynchronization(new TransactionSynchro
     JOIN room_items ri ON ri.id = pi.item_id
     WHERE ri.room_id = #{roomId}
 </select>
-```
 
----
-
-### 6.2 Phase 2 — 결제 준비 (prepare)
-
-**API**: `POST /api/rooms/{roomId}/payments/prepare` (MEMBER)
-
-```java
-// PaymentDto.java
-public class PaymentDto {
-    @Getter @Builder @AllArgsConstructor
-    public static class PrepareResponse {
-        private String orderId;
-        private String orderName;    // "망원시장 공동장보기 (3개 품목)"
-        private Integer amount;
-        private String customerKey;  // Toss 위젯용, user id 기반 UUID (이메일 등 PII 금지)
-    }
-
-    @Getter @NoArgsConstructor(access = AccessLevel.PROTECTED) @AllArgsConstructor
-    public static class ConfirmRequest {
-        private String paymentKey;
-        private String orderId;
-        private Integer amount;
-    }
-
-    @Getter @Builder @AllArgsConstructor
-    public static class PaymentResponse {
-        private String orderId;
-        private String status;
-        private Integer amount;
-        private String method;
-        private LocalDateTime approvedAt;
-    }
-}
-```
-
-```java
-// PaymentTxService.java
-@Transactional
-public PaymentVO prepare(Long roomId, Long userId) {
-    RoomVO room = roomMapper.findRoomById(roomId);
-    if (room == null || !"SETTLING".equals(room.getStatus())) {
-        throw new PaymentException(PaymentErrorCode.ROOM_NOT_SETTLING);
-    }
-
-    // 참여자 행 잠금 → 같은 참여자의 동시 prepare 직렬화
-    RoomParticipantVO participant = roomParticipantMapper.findByRoomIdAndUserIdForUpdate(roomId, userId);
-    if (participant == null) throw new PaymentException(PaymentErrorCode.NOT_PARTICIPANT);
-    if ("HOST".equals(participant.getRole())) throw new PaymentException(PaymentErrorCode.HOST_CANNOT_PAY);
-    if ("PAID".equals(participant.getSettlementStatus())) throw new PaymentException(PaymentErrorCode.ALREADY_PAID);
-
-    // 진행 중인 결제가 있으면 재사용 (멱등) — 금액은 스냅샷 기준이라 바뀌지 않음
-    PaymentVO active = paymentMapper.findActiveByParticipantId(participant.getId()); // READY, IN_PROGRESS
-    if (active != null) {
-        if (PaymentStatus.IN_PROGRESS.name().equals(active.getStatus())) {
-            throw new PaymentException(PaymentErrorCode.PAYMENT_IN_PROGRESS);
-        }
-        return active;
-    }
-
-    int amount = settlementLineMapper.sumAmountByParticipantId(participant.getId());
-
-    PaymentVO payment = PaymentVO.builder()
-            .orderId(UUID.randomUUID().toString())
-            .roomId(roomId)
-            .participantId(participant.getId())
-            .userId(userId)
-            .amount(amount)
-            .orderName(buildOrderName(room))
-            .status(PaymentStatus.READY.name())
-            .build();
-    paymentMapper.insert(payment);
-    return payment;
-}
-```
-
-> **금액은 절대 클라이언트에서 받지 않는다.** 서버가 스냅샷으로 계산해 `payments.amount`에 저장하고, confirm 때 Toss redirect로 넘어온 `amount`와 비교만 한다.
-
----
-
-### 6.3 Phase 3 — 결제 승인 (confirm) ★ 핵심
-
-**API**: `POST /api/payments/confirm`
-
-원칙
-1. 금액 위변조 검증: `request.amount == payments.amount` 아니면 거부 (Toss 호출 안 함)
-2. 중복 승인 방지: `READY → IN_PROGRESS` CAS. 0 rows면 다른 요청이 처리 중/완료
-3. Toss 호출은 **트랜잭션 밖**에서, `Idempotency-Key: {orderId}` 헤더 포함
-4. 결과 분기
-   - 성공 → `DONE` + participant `PAID` + (전원 완료 시) room `COMPLETED` — 한 트랜잭션
-   - Toss가 명확히 거절(4xx, 예: `REJECT_CARD_COMPANY`) → `FAILED`
-   - 타임아웃 / 5xx / 네트워크 오류 → **상태를 바꾸지 않고 `IN_PROGRESS` 유지**, 클라이언트엔 "확인 중" 응답. 대사 스케줄러가 Toss 조회로 확정
-   - 승인 성공했는데 DB 반영 실패 → 로그(ERROR) + `IN_PROGRESS` 유지 → 대사 스케줄러가 `DONE`으로 복구 (돈은 받았는데 기록이 없는 상황 방지)
-
-```java
-// PaymentServiceImpl.java — 트랜잭션 없음 (오케스트레이션)
-@Slf4j
-@Service
-@RequiredArgsConstructor
-public class PaymentServiceImpl implements PaymentService {
-    private final PaymentTxService txService;
-    private final TossPaymentsClient tossClient;
-    private final UserMapper userMapper;
-
-    public PaymentDto.PaymentResponse confirm(String email, PaymentDto.ConfirmRequest req) {
-        UserVO user = userMapper.findByEmail(email);
-        if (user == null) throw new IllegalArgumentException("존재하지 않는 사용자입니다.");
-
-        // (tx1) 검증 + READY → IN_PROGRESS
-        PaymentVO payment = txService.markInProgress(req.getOrderId(), user.getId(), req.getAmount(), req.getPaymentKey());
-
-        TossPaymentResponse toss;
-        try {
-            toss = tossClient.confirm(req.getPaymentKey(), req.getOrderId(), req.getAmount());
-        } catch (TossApiException e) {
-            if (e.isDefinitive()) {               // 4xx 확정 실패
-                txService.markFailed(payment.getOrderId(), e.getCode(), e.getMessage()); // (tx2)
-                throw new PaymentException(PaymentErrorCode.PG_REJECTED, e.getMessage());
-            }
-            log.warn("Toss 승인 결과 불명확, 대사 대기: orderId={}", payment.getOrderId(), e);
-            throw new PaymentException(PaymentErrorCode.PAYMENT_PENDING);
-        } catch (ResourceAccessException e) {     // 타임아웃/연결 오류
-            log.warn("Toss 승인 타임아웃, 대사 대기: orderId={}", payment.getOrderId(), e);
-            throw new PaymentException(PaymentErrorCode.PAYMENT_PENDING);
-        }
-
-        // (tx3) DONE + PAID + room COMPLETED 판단
-        try {
-            return txService.markDone(payment.getOrderId(), toss);
-        } catch (RuntimeException e) {
-            // 돈은 승인됐는데 DB 반영 실패 → 반드시 추적 가능해야 함
-            log.error("[PAYMENT-DB-SYNC-FAIL] 승인 완료 후 DB 반영 실패: orderId={}, paymentKey={}",
-                    payment.getOrderId(), toss.getPaymentKey(), e);
-            throw new PaymentException(PaymentErrorCode.PAYMENT_PENDING);
-        }
-    }
-}
-```
-
-```java
-// PaymentTxService.java
-@Transactional
-public PaymentVO markInProgress(String orderId, Long userId, Integer amount, String paymentKey) {
-    PaymentVO payment = paymentMapper.findByOrderId(orderId);
-    if (payment == null || !payment.getUserId().equals(userId)) {
-        throw new PaymentException(PaymentErrorCode.PAYMENT_NOT_FOUND); // 타인 주문은 존재 여부도 숨김
-    }
-    if (!payment.getAmount().equals(amount)) {
-        log.warn("결제 금액 불일치: orderId={}, expected={}, actual={}", orderId, payment.getAmount(), amount);
-        throw new PaymentException(PaymentErrorCode.AMOUNT_MISMATCH);
-    }
-    if (PaymentStatus.DONE.name().equals(payment.getStatus())) {
-        throw new PaymentException(PaymentErrorCode.ALREADY_PAID);
-    }
-    int updated = paymentMapper.updateStatusWithKey(orderId, PaymentStatus.READY, PaymentStatus.IN_PROGRESS, paymentKey);
-    if (updated == 0) {
-        throw new PaymentException(PaymentErrorCode.PAYMENT_IN_PROGRESS);
-    }
-    return payment;
-}
-
-@Transactional
-public PaymentDto.PaymentResponse markDone(String orderId, TossPaymentResponse toss) {
-    int updated = paymentMapper.markDone(orderId, toss.getPaymentKey(), toss.getMethod(), toss.getApprovedAt());
-    if (updated == 0) {
-        // 이미 웹훅/대사에서 DONE 처리됨 → 멱등하게 현재 상태 반환
-        return PaymentDto.PaymentResponse.from(paymentMapper.findByOrderId(orderId));
-    }
-    PaymentVO payment = paymentMapper.findByOrderId(orderId);
-    roomParticipantMapper.updateSettlementStatus(payment.getParticipantId(), "PAID");
-
-    if (roomParticipantMapper.countUnpaidMembers(payment.getRoomId()) == 0) {
-        roomMapper.updateStatus(payment.getRoomId(), "SETTLING", "COMPLETED");
-    }
-    return PaymentDto.PaymentResponse.from(payment);
-}
-```
-
-```xml
-<!-- paymentMapper.xml (발췌) -->
-<update id="updateStatusWithKey">
-    UPDATE `payments`
-    SET status = #{to}, payment_key = #{paymentKey}
-    WHERE order_id = #{orderId}
-      AND status = #{from}
-</update>
-
-<update id="markDone">
-    UPDATE `payments`
-    SET status = 'DONE',
-        payment_key = #{paymentKey},
-        method = #{method},
-        approved_at = #{approvedAt}
-    WHERE order_id = #{orderId}
-      AND status IN ('READY', 'IN_PROGRESS')
-</update>
-
-<select id="findStaleInProgress" resultType="com.shareCart.project.domain.payment.model.vo.PaymentVO">
-    SELECT id, order_id, payment_key, room_id, participant_id, user_id, amount, status
-    FROM `payments`
-    WHERE status = 'IN_PROGRESS'
-      AND updated_at &lt; #{before}
-    ORDER BY updated_at
-    LIMIT #{limit}
+<!-- roomParticipantMapper.xml -->
+<select id="countMembersByStatus" resultType="int">
+    SELECT COUNT(*) FROM room_participants
+    WHERE room_id = #{roomId} AND role = 'MEMBER' AND settlement_status = #{status}
 </select>
 ```
 
 ---
 
-### 6.4 Toss 클라이언트
+## 7. 예외 처리 (이번 기능 전용)
 
-```yaml
-# application-secret.yaml (git 미추적)
-toss:
-  payments:
-    secret-key: test_sk_xxxxxxxx      # 테스트 키부터 시작
-    base-url: https://api.tosspayments.com
-    connect-timeout: 3s
-    read-timeout: 30s                 # Toss 권장: 승인 API는 응답이 늦을 수 있음
-```
+장보기 시작·정산 시작이 거부되면 클라이언트가 "무엇을 고쳐야 하는지" 보여줘야 하므로 상세 목록을 응답에 싣는다. **핸들러는 `SettlementController`에만 적용**하고 기존 API는 건드리지 않는다(전체 적용은 2차, §12).
 
 ```java
-@ConfigurationProperties(prefix = "toss.payments")
-public record TossPaymentsProperties(String secretKey, String baseUrl,
-                                     Duration connectTimeout, Duration readTimeout) {}
-```
-
-```java
-@Slf4j
-@Component
-public class TossPaymentsClient {
-    private final RestClient restClient;
-
-    public TossPaymentsClient(TossPaymentsProperties props, RestClient.Builder builder) {
-        String basic = Base64.getEncoder()
-                .encodeToString((props.secretKey() + ":").getBytes(StandardCharsets.UTF_8));
-
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(props.connectTimeout());
-        factory.setReadTimeout(props.readTimeout());
-
-        this.restClient = builder
-                .baseUrl(props.baseUrl())
-                .requestFactory(factory)
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Basic " + basic)
-                .defaultStatusHandler(HttpStatusCode::isError, (req, res) -> {
-                    TossErrorResponse body = readError(res);
-                    throw new TossApiException(res.getStatusCode().value(), body.code(), body.message());
-                })
-                .build();
-    }
-
-    public TossPaymentResponse confirm(String paymentKey, String orderId, int amount) {
-        return restClient.post()
-                .uri("/v1/payments/confirm")
-                .header("Idempotency-Key", orderId)   // 재시도해도 이중 승인 없음
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of("paymentKey", paymentKey, "orderId", orderId, "amount", amount))
-                .retrieve()
-                .body(TossPaymentResponse.class);
-    }
-
-    public TossPaymentResponse getByOrderId(String orderId) {
-        return restClient.get()
-                .uri("/v1/payments/orders/{orderId}", orderId)
-                .retrieve()
-                .body(TossPaymentResponse.class);
-    }
-
-    public TossPaymentResponse cancel(String paymentKey, String reason, String idempotencyKey) {
-        return restClient.post()
-                .uri("/v1/payments/{paymentKey}/cancel", paymentKey)
-                .header("Idempotency-Key", idempotencyKey)
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of("cancelReason", reason))
-                .retrieve()
-                .body(TossPaymentResponse.class);
-    }
-}
-```
-
-```java
-public class TossApiException extends RuntimeException {
-    private final int httpStatus;
-    private final String code;
-    // 4xx = Toss가 명확히 거절 → FAILED 확정 가능
-    // 5xx / 일부 코드(PROVIDER_ERROR, FAILED_INTERNAL_SYSTEM_PROCESSING 등) = 결과 불명확 → 대사
-    public boolean isDefinitive() {
-        return httpStatus >= 400 && httpStatus < 500 && !UNCERTAIN_CODES.contains(code);
-    }
-}
-```
-
----
-
-### 6.5 Phase 4 — 대사(reconciliation) 스케줄러 & 웹훅
-
-```java
-@Slf4j
-@Component
+@Getter
 @RequiredArgsConstructor
-public class PaymentReconcileScheduler {
-    private static final Duration IN_PROGRESS_GRACE = Duration.ofMinutes(1);
-    private static final Duration READY_EXPIRE = Duration.ofMinutes(30);
-    private static final int BATCH_SIZE = 50;
+public enum SettlementErrorCode {
+    UNALLOCATED_ITEMS("구매 수량과 할당 수량이 맞지 않는 품목이 있습니다."),
+    MEMBER_WITHOUT_ITEMS("아무 품목도 담지 않은 참여자가 있습니다."),
+    PRICE_NOT_SET("실제 가격이 입력되지 않은 품목이 있습니다.");
+    private final String message;
+}
 
-    private final PaymentMapper paymentMapper;
-    private final PaymentTxService txService;
-    private final TossPaymentsClient tossClient;
-
-    @Scheduled(fixedDelay = 60_000)
-    public void reconcileInProgress() {
-        LocalDateTime before = LocalDateTime.now().minus(IN_PROGRESS_GRACE);
-        for (PaymentVO p : paymentMapper.findStaleInProgress(before, BATCH_SIZE)) {
-            try {
-                TossPaymentResponse toss = tossClient.getByOrderId(p.getOrderId());
-                switch (toss.getStatus()) {
-                    case "DONE" -> txService.markDone(p.getOrderId(), toss);
-                    case "ABORTED", "EXPIRED" -> txService.markFailed(p.getOrderId(), toss.getStatus(), "PG 상태 동기화");
-                    default -> log.info("대사 보류: orderId={}, tossStatus={}", p.getOrderId(), toss.getStatus());
-                }
-            } catch (TossApiException e) {
-                if ("NOT_FOUND_PAYMENT".equals(e.getCode())) {
-                    // Toss에 승인 시도 기록 자체가 없음 → 승인 요청이 도달하지 못함
-                    txService.markFailed(p.getOrderId(), e.getCode(), "PG 승인 기록 없음");
-                } else {
-                    log.error("대사 실패: orderId={}", p.getOrderId(), e);
-                }
-            } catch (Exception e) {
-                log.error("대사 실패: orderId={}", p.getOrderId(), e);
-            }
-        }
-    }
-
-    @Scheduled(fixedDelay = 300_000)
-    public void expireReady() {
-        int expired = paymentMapper.expireReadyBefore(LocalDateTime.now().minus(READY_EXPIRE));
-        if (expired > 0) log.info("READY 결제 만료 처리: {}건", expired);
-    }
+// domain/settlement/exception/SettlementExceptionHandler.java
+@Slf4j
+@RestControllerAdvice(assignableTypes = SettlementController.class) // 정산 컨트롤러에만 적용
+public class SettlementExceptionHandler {
+    @ExceptionHandler(SettlementValidationException.class)   // 400 + { code, message, details }
+    @ExceptionHandler(IllegalArgumentException.class)        // 400 + { code, message }
+    @ExceptionHandler(IllegalStateException.class)           // 409 + { code, message }
 }
 ```
 
-> 다중 인스턴스 배포 시 스케줄러 중복 실행 가능. 상태 CAS 덕에 결과는 안전하지만 Toss API 호출이 중복됨 → 필요 시 Redis `SET lock:reconcile NX EX 55`로 단일 실행 보장 (기존 `SyncScheduler`와 같은 문제이므로 함께 적용 검토).
-
-**웹훅** `POST /api/payments/webhook` (Toss 콘솔 등록, `SecurityConfig`에 `permitAll`)
-- 본문(`eventType=PAYMENT_STATUS_CHANGED`, `data.orderId`)은 **신뢰하지 않고 트리거로만 사용**: `tossClient.getByOrderId()`로 재조회 후 위와 동일 분기.
-- 항상 200 응답 (Toss 재전송 폭주 방지). 처리 실패는 로그 + 대사 스케줄러가 보완.
-- 중복 수신 대비: `SET webhook:{transmissionId} 1 NX EX 86400`(Redis, TTL 필수 규칙 준수).
-
----
-
-### 6.6 Phase 5 — 결제 취소/환불
-
-**API**: `POST /api/payments/{orderId}/cancel` (본인 또는 HOST)
-
-정책(제안, §12에서 확정 필요)
-- `meet_at` 이전 & room `SETTLING`일 때만 본인 취소 허용
-- room `COMPLETED` 이후 취소는 HOST 승인 필요(또는 운영자)
-
-```java
-public PaymentDto.PaymentResponse cancel(String email, String orderId, String reason) {
-    PaymentVO payment = txService.markCanceling(orderId, userId);   // DONE → CANCELING (CAS)
-    try {
-        TossPaymentResponse toss = tossClient.cancel(payment.getPaymentKey(), reason, "cancel-" + orderId);
-        return txService.markCanceled(orderId, toss);               // CANCELED + participant UNPAID
-    } catch (TossApiException e) {
-        if (e.isDefinitive()) {
-            txService.revertCanceling(orderId);                     // CANCELING → DONE
-            throw new PaymentException(PaymentErrorCode.CANCEL_REJECTED, e.getMessage());
-        }
-        throw new PaymentException(PaymentErrorCode.PAYMENT_PENDING); // 대사가 확정
-    }
-}
-```
-→ `PaymentStatus`에 `CANCELING` 추가, 대사 스케줄러가 `CANCELING`도 조회해 `CANCELED`/`DONE`으로 확정.
-
----
-
-## 7. API 명세 요약
-
-| Method | Path | 인증 | Req | Res | 주요 에러 |
-|---|---|---|---|---|---|
-| PATCH | `/api/rooms/{roomId}/items/{itemId}/price` | HOST | `{actualPrice}` | 200 | 403, 409(정산 중) |
-| POST | `/api/rooms/{roomId}/settlement` | HOST | - | `StartResponse` | 403, 409(이미 시작), 400(가격 미입력) |
-| GET | `/api/rooms/{roomId}/settlement` | 참여자 | - | 내 분담금 + 라인 | 403 |
-| POST | `/api/rooms/{roomId}/payments/prepare` | MEMBER | - | `PrepareResponse` | 409(이미 결제/진행 중) |
-| POST | `/api/payments/confirm` | MEMBER | `{paymentKey, orderId, amount}` | `PaymentResponse` | 400(금액 불일치), 402(PG 거절), 409, **202(확인 중)** |
-| POST | `/api/payments/fail` | MEMBER | `{orderId, code, message}` | 200 | - (failUrl 기록용) |
-| POST | `/api/payments/{orderId}/cancel` | 본인/HOST | `{reason}` | `PaymentResponse` | 409 |
-| GET | `/api/payments/{orderId}` | 본인 | - | `PaymentResponse` | 404 |
-| POST | `/api/payments/webhook` | permitAll | Toss 이벤트 | 200 | - |
-
-> `PAYMENT_PENDING`은 **202 Accepted**로 응답 → 클라이언트는 `GET /api/payments/{orderId}`를 폴링.
+- 기존 컨트롤러(`RoomController`)의 응답은 바뀌지 않는다. 이번에 기존 API에 추가하는 검사(품목 수정의 상태 검사, `allocateItem`의 `RECRUITING`·잠금 검사)도 기존과 같이 `IllegalStateException`을 던지고 기존 방식대로 응답한다.
 
 ---
 
@@ -751,113 +412,78 @@ public PaymentDto.PaymentResponse cancel(String email, String orderId, String re
 
 | 파일 | 변경 |
 |---|---|
-| `RoomVO` | `status` 필드 추가 |
-| `roomMapper.xml` `findRoomById` | `status` 컬럼 SELECT 추가, `updateStatus` 추가 |
-| `RoomMapper` | `updateStatus(roomId, from, to)` |
-| `RoomItemMapper` / xml | `findRoomItemsByRoomId`, `updateActualPrice` |
-| `ParticipantItemMapper` / xml | `findByRoomId` |
-| `RoomParticipantMapper` / xml | `findByRoomIdAndUserIdForUpdate`, `updateSettlementStatus`, `countUnpaidMembers` |
-| `RoomParticipantServiceImpl.allocateItem` | 방 상태 검사 + `ROOM_LOCKED(-4)` 처리 |
+| `RoomVO` | `status` 필드 |
+| `roomMapper.xml` / `RoomMapper` | `findRoomById`에 `status` SELECT, `updateStatus` |
+| `roomItemMapper.xml` / `RoomItemMapper` | `findRoomItemsByRoomId`, 기존 `updateItemDetails`에 `actual_price` |
+| `RoomItemServiceImpl.updateItemDetails` / `RoomDto.UpdateItemDetailsRequest` | `actualPrice` 필드, 방 상태 검사(`RECRUITING`/`SHOPPING`) |
+| `participantItemMapper.xml` / `ParticipantItemMapper` | `findByRoomId` |
+| `roomParticipantMapper.xml` / `RoomParticipantMapper` | `findByRoomId`, `updateSettlementStatus`, `countMembersByStatus` |
+| `RoomParticipantServiceImpl.allocateItem` | `RECRUITING` 검사 + `ROOM_LOCKED(-4)` 처리 |
 | `scripts/alloc.lua` | `KEYS[5]` 잠금 키 검사 |
 | `SyncScheduler` | `syncItem` → `AllocationFlusher`로 추출 |
-| `RoomServiceImpl.joinRoom` 관련 | `SETTLING` 이후 참여 차단 (`increaseParticipants`에 `AND status = 'RECRUITING'`) |
-| `SecurityConfig` | `/api/payments/webhook` permitAll |
-| `application.yaml` | `toss.payments.*` 비밀 아닌 값(base-url, timeout) |
-| `ProjectApplication` | `@ConfigurationPropertiesScan` 추가 |
-| 신규 Mapper | `@Param`은 `org.apache.ibatis.annotations.Param` 사용 |
+| `RoomServiceImpl.joinRoom` 관련 | `RECRUITING`에서만 참여 |
+| 신규 `SettlementExceptionHandler` | §7, `SettlementController` 전용(기존 API 영향 없음) |
+| `schema.sql` | **변경 없음** |
 
 ---
 
-## 9. 예외 처리 (제안)
-
-결제는 클라이언트가 응답 코드로 분기해야 하므로(202 확인 중 vs 402 거절 vs 409 중복) 전용 예외 + 전역 핸들러를 둔다. 기존 `IllegalArgument/IllegalStateException`은 그대로 두되 핸들러에서 400/409로 매핑하면 기존 API에도 일관된 에러 바디가 생긴다.
-
-```java
-@Getter
-@RequiredArgsConstructor
-public enum PaymentErrorCode {
-    ROOM_NOT_SETTLING(HttpStatus.CONFLICT, "정산 중인 방이 아닙니다."),
-    NOT_PARTICIPANT(HttpStatus.FORBIDDEN, "이 방에 참여하지 않은 사용자입니다."),
-    HOST_CANNOT_PAY(HttpStatus.BAD_REQUEST, "방장은 결제 대상이 아닙니다."),
-    ALREADY_PAID(HttpStatus.CONFLICT, "이미 결제가 완료되었습니다."),
-    PAYMENT_NOT_FOUND(HttpStatus.NOT_FOUND, "결제 정보를 찾을 수 없습니다."),
-    AMOUNT_MISMATCH(HttpStatus.BAD_REQUEST, "결제 금액이 일치하지 않습니다."),
-    PAYMENT_IN_PROGRESS(HttpStatus.CONFLICT, "결제가 진행 중입니다."),
-    PAYMENT_PENDING(HttpStatus.ACCEPTED, "결제 결과를 확인 중입니다."),
-    PG_REJECTED(HttpStatus.PAYMENT_REQUIRED, "결제가 거절되었습니다."),
-    CANCEL_REJECTED(HttpStatus.CONFLICT, "결제 취소가 거절되었습니다.");
-
-    private final HttpStatus status;
-    private final String message;
-}
-
-@Slf4j
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-    @ExceptionHandler(PaymentException.class)
-    public ResponseEntity<ErrorResponse> handlePayment(PaymentException e) {
-        return ResponseEntity.status(e.getErrorCode().getStatus())
-                .body(new ErrorResponse(e.getErrorCode().name(), e.getMessage()));
-    }
-    // IllegalArgumentException → 400, IllegalStateException → 409
-}
-```
-
----
-
-## 10. 보안 체크리스트
-
-- [ ] 결제 금액은 서버 계산값만 사용, confirm 시 금액 대조
-- [ ] `orderId`는 추측 불가능한 UUID, 조회/승인 시 `user_id` 소유권 확인
-- [ ] 시크릿 키는 `application-secret.yaml`에만 (로그에 Authorization 헤더 출력 금지 — 현재 `org.springframework.security: DEBUG` 외 HTTP 클라이언트 로그 레벨 확인)
-- [ ] `customerKey`에 이메일/전화번호 등 PII 사용 금지
-- [ ] 웹훅 본문 신뢰 금지 → Toss API 재조회
-- [ ] 카드번호 등 결제수단 원문은 저장하지 않음 (Toss 응답 중 `method`, 승인 시각만 저장)
-- [ ] 로그에 `paymentKey`는 남기되 응답 원문 전체 덤프 금지
-
----
-
-## 11. 테스트 계획
+## 9. 테스트 계획
 
 | 레벨 | 대상 | 케이스 |
 |---|---|---|
-| 단위 | `SettlementCalculator` | 균등 분할, 내림 잔액, 미할당 수량, 할당 0, 큰 금액(int 오버플로 방지) |
-| 단위 | `PaymentServiceImpl` (Mockito, `TossPaymentsClient` mock) | 성공 / 금액 불일치 시 Toss 미호출 / 4xx → FAILED / 타임아웃 → IN_PROGRESS 유지 / 승인 성공 후 DB 실패 → PENDING |
-| 단위 | `TossPaymentsClient` (`MockRestServiceServer`) | Authorization·Idempotency-Key 헤더, 에러 바디 파싱, 타임아웃 |
-| 통합 | `SettlementService` (MySQL + Redis, docker-compose) | Redis에만 있는 할당이 스냅샷에 반영되는지, 정산 시작 후 `allocateItem` 거부 |
-| 동시성 | confirm 중복 | 같은 orderId로 10개 스레드 동시 confirm → Toss 호출 1회, DONE 1건 (`CountDownLatch` + `ExecutorService`) |
-| 동시성 | prepare 중복 | 같은 참여자 동시 prepare → READY 1건 |
-| 동시성 | 정산 시작 ↔ 할당 경합 | 할당 요청 폭주 중 정산 시작 → 스냅샷 합계 == 잠금 직후 Redis 합계 |
-| 통합 | 대사 스케줄러 | IN_PROGRESS + Toss DONE → DONE, NOT_FOUND → FAILED |
-| 컨트롤러 | `@WebMvcTest` | 상태 코드 매핑(202/402/409), 인증 없는 요청 401, 웹훅 permitAll |
-
-> 실제 Toss 호출은 테스트 키로 수동 E2E만 진행 (CI에서 외부 호출 금지).
-
----
-
-## 12. 결정 필요 사항 (검토 요청)
-
-1. **PG 선택**: 토스페이먼츠로 진행해도 될까요? (대안: 포트원(아임포트) — 여러 PG 추상화, 연동 코드 거의 동일)
-2. **돈의 흐름**: 이 계획은 "플랫폼이 참여자 결제를 받는다"까지만 다룹니다. **방장에게 정산금을 지급(payout)** 하려면 Toss 지급대행/에스크로 계약 및 전자금융업 관련 검토가 필요합니다. MVP는
-   - (A) PG 결제 후 운영자가 수동 송금, 또는
-   - (B) PG 없이 "송금 완료" 체크 + 방장 확인 방식(기록만)
-   중 무엇으로 할지 정해주세요.
-3. **내림 잔액·미할당분을 방장 부담**으로 하는 규칙 OK?
-4. **취소/환불 정책**: 언제까지, 누가 취소할 수 있는지.
-5. **소액(100원 미만) 분담금** 처리: 결제 생략 후 PAID 처리 OK?
-6. **DDL 반영 방식**: `schema.sql`에 추가만 할지, 별도 마이그레이션 파일(`docs/migrations/V2__payment.sql` 등)로 둘지. (승인 전 실행하지 않음)
+| 단위 | `SettlementCalculator` | 균등 분할, 나머지 방장 부담(방장 할당 있음/없음), **Σ 분담금 == Σ 실제가**, 할당 부족·초과 검출, 큰 금액(오버플로) |
+| 단위 | 품목 수정 API 보강 | `SETTLING`/`COMPLETED`에서 거부, `SHOPPING`에서 허용, `actualPrice` 저장 |
+| 통합 | 장보기 시작 (MySQL + Redis) | Redis에만 있는 할당이 DB에 반영되는지, 시작 후 `allocateItem` 거부, **검증 실패(미할당, 아무것도 안 담은 MEMBER) 시 `RECRUITING` 복귀 + 잠금 해제 + 다시 할당 가능**, 일부 품목만 안 담은 MEMBER는 통과 |
+| 동시성 | 장보기 시작 ↔ 할당 경합 | 할당 폭주 중 장보기 시작 → DB 할당 합계 == 잠금 직후 Redis 합계 |
+| 동시성 | 장보기 시작·정산 시작 중복 | 동시 2회 → 1회만 성공 |
+| 통합 | 할당 다시 열기 | `SHOPPING → RECRUITING`, 잠금 해제 후 할당 가능 |
+| 통합 | 정산 시작 | 실제가 미입력·수량 불일치 시 `SHOPPING` 유지 + 계좌 미저장, 성공 시 계좌 키 TTL 7일 |
+| 통합 | 입금 확인 | 방장만 가능, `SETTLING`에서만, HOST 대상 거부, 체크 해제 가능, MEMBER 전원 `PAID` → `COMPLETED` + 계좌·잠금 키 삭제, **`COMPLETED` 이후 변경 거부** |
+| 통합 | 정산 취소 | `PAID` 있으면 거부, 없으면 `SHOPPING` 복귀 + 계좌 키 삭제 + 실제가 수정 가능 |
+| 컨트롤러 | `@WebMvcTest` | 정산 API의 400(+상세)/403/409 매핑, 비참여자에게 계좌 미노출, **기존 API 응답은 변하지 않음** |
 
 ---
 
-## 13. 작업 순서 & 예상 PR 단위
+## 10. 결정 사항 (확정)
+
+| # | 항목 | 결정 |
+|---|---|---|
+| 1 | 장보는 동안 할당 변경 | 불가. 장보기 시작 시 잠금 |
+| 2 | 계좌 보관 | Redis TTL 7일 |
+| 3 | 원 단위 나머지 | 방장 부담 |
+| 4 | 아무 품목도 안 담은 MEMBER | 허용 안 함(장보기 시작 차단). 일부 품목만 안 담는 것은 허용, 전체 중 최소 1개 품목은 담아야 함 |
+| 5 | `COMPLETED` 되돌리기 | 불가 |
+| 6 | 예외 핸들러 | **이번 정산 기능에만** 적용. 기존 API는 건드리지 않음(전체 적용은 2차, §12) |
+| 7 | 범위 | MVP만 구현. 나머지는 §12 "2차 구현"으로 미룸 |
+
+남은 결정 사항 없음.
+
+---
+
+## 11. 작업 순서 & 예상 PR 단위
 
 | # | PR | 내용 | 의존 |
 |---|---|---|---|
 | 1 | `refactor: AllocationFlusher 추출` | `SyncScheduler.syncItem` 분리, 동작 동일 | - |
-| 2 | `feat: 방 상태 전이 및 실제가 입력` | `RoomVO.status`, `updateStatus`, price API, 참여/할당 상태 검사, `alloc.lua` 잠금 | 1 |
-| 3 | `feat: 정산 시작 및 분담금 스냅샷` | DDL(`settlement_lines`), Calculator, SettlementService + 테스트 | 2, DDL 승인 |
-| 4 | `feat: 결제 준비/승인` | DDL(`payments`), TossClient, prepare/confirm, 예외 핸들러 + 테스트 | 3 |
-| 5 | `feat: 결제 대사 스케줄러 및 웹훅` | Reconcile, webhook | 4 |
-| 6 | `feat: 결제 취소` | cancel + CANCELING 대사 | 5 |
+| 2 | `feat: 방 상태 검사 및 장보기 시작` | `RoomVO.status`, `updateStatus`, 품목 수정 API에 `actualPrice`·상태 검사, 할당/참여 상태 검사, `alloc.lua` 잠금, 장보기 시작/할당 다시 열기, 정산 전용 예외 핸들러 + 테스트 | 1 |
+| 3 | `feat: 정산 시작 및 조회` | Calculator, 정산 시작/조회(계좌 Redis 저장) + 테스트 | 2 |
+| 4 | `feat: 입금 확인 및 정산 취소` | 상태 체크 API, `COMPLETED` 전이, 정산 취소 + 테스트 | 3 |
 
 각 PR 완료 조건: `./gradlew test` 통과, 신규/변경 API의 테스트 동반.
+
+---
+계
+## 12. 2차 구현 (MVP 이후)
+
+MVP는 "장보기 시작 → 실제가 입력 → 정산 → 입금 확인 → 완료" 한 바퀴만 동작하게 한다. 아래는 이번에 만들지 않고 2차로 미룬다.
+
+| # | 항목 | MVP에서의 대체 / 한계 | 2차에서 할 일 |
+|---|---|---|---|
+| 1 | 계좌 재입력 API (`PUT .../settlement/account`) | TTL 7일 만료나 Redis 장애로 계좌가 사라지면 조회 시 계좌가 비어 있음 → 방장이 MEMBER에게 직접 알려줌 | 재입력 API 추가, 또는 계좌를 DB에 저장 |
+| 2 | 전역 예외 처리 (기존 API 포함) | 정산 기능 컨트롤러에만 핸들러 적용. 기존 API는 지금 응답 그대로 | `@RestControllerAdvice` 범위를 전체로 넓히고 기존 API 응답 코드 정리 + 프론트 공유 + 기존 테스트 수정. Redis 장애용 `IllegalStateException`은 별도 예외로 분리 |
+| 3 | 방장이 할당을 직접 조정하는 API | 덜 산 경우 "할당 다시 열기"로 전체 할당을 다시 열어야 함 | 방장이 특정 MEMBER 할당을 줄이는 API |
+| 4 | 방 나가기 / 강퇴 API | 없음. 아무 품목도 안 담은 MEMBER는 "할당하기"로만 해소 가능 | 나가기는 `RECRUITING`/`COMPLETED`에서만 허용, `SHOPPING`/`SETTLING`에서는 거부 |
+| 5 | MEMBER "송금했어요" 알림 | 방장이 은행 앱에서 직접 확인 | 송금 완료 표시 + 방장 알림 |
+| 6 | 미입금자 처리 (독촉·강퇴) | 고려하지 않음 | 독촉 알림, 강퇴 후 재정산 |
+| 7 | 정산 미리보기 | 정산 시작 후에야 금액 확인 가능 | `SHOPPING`에서 예상 분담금 조회 |
+| 8 | 정산 취소 경합 보완 | `PAID` 확인과 상태 변경 사이 경합 가능(방장 본인 요청끼리라 드묾) | `updateStatus` 조건에 `NOT EXISTS (PAID MEMBER)` 추가 |
